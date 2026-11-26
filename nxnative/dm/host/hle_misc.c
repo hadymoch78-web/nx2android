@@ -105,10 +105,11 @@ HLE_FORCE("_ZN2nn3err9ShowErrorENS_6ResultE", "error display applet; the host pr
 // The class is polymorphic, and games call it through its vtable too: Monster Hunter Rise checks the hunter's name with slot 8, MaskProfanityWordsInText(int *, char16_t *, uint32_t)
 // (main+0x6bca160). The constructor used to do nothing, the object kept what the heap held there, and that call jumped into the heap. It now gets a host vtable: each slot of the SDK's
 // (_ZTVN2nn3ngc15ProfanityFilterE) is matched by address with the class's methods and given the host's version (no word list: nothing is profanity, nothing is masked); others return 0
-static Result ngc_v_zero(void) { return RES_OK; }
+static Result ngc_v_zero(void) { static int n; if (n++ < 8) LOG("[RED] ngc: unmatched ProfanityFilter vtable slot called (call %d, return %p)", n, __builtin_return_address(0)); return RES_OK; }
+static uint32_t ngc_v_one(void) { return 1; }
 static void ngc_v_none(void *self) { (void)self; }
-static Result ngc_v_check(void *self, uint32_t *masks, uint32_t pat, const void **words, uint64_t n) { (void)self; (void)pat; (void)words; for (uint64_t i = 0; masks && i < n; i++) masks[i] = 0; return RES_OK; }
-static Result ngc_v_mask(void *self, int *masked, void *text, uint32_t region) { (void)self; (void)text; (void)region; if (masked) *masked = 0; return RES_OK; }
+static Result ngc_v_check(void *self, uint32_t *masks, uint32_t pat, const void **words, uint64_t n) { static int c; if (!c++) LOG("ngc: CheckProfanityWords through vtable (%llu words, all clean)", (unsigned long long)n); (void)self; (void)pat; (void)words; for (uint64_t i = 0; masks && i < n; i++) masks[i] = 0; return RES_OK; }
+static Result ngc_v_mask(void *self, int *masked, void *text, uint32_t region) { static int c; if (!c++) LOG("ngc: MaskProfanityWordsInText through vtable (nothing masked)"); (void)self; (void)text; (void)region; if (masked) *masked = 0; return RES_OK; }
 static void *ngc_vtable(void) {
     enum { NV = 40 }; static void *vt[NV + 2]; static int built;
     if (built) return built > 0 ? &vt[2] : NULL;
@@ -116,6 +117,7 @@ static void *ngc_vtable(void) {
     if (!sdk) { built = -1; LOG("[RED] ProfanityFilter: the SDK has no vtable symbol; objects keep none"); return NULL; }
     static const struct { const char *name; void *fn; } M[] = {
         {"_ZN2nn3ngc15ProfanityFilterD1Ev", (void *)ngc_v_none}, {"_ZN2nn3ngc15ProfanityFilterD0Ev", (void *)ngc_v_none}, {"_ZN2nn3ngc15ProfanityFilter8FinalizeEv", (void *)ngc_v_none},
+        {"_ZN2nn3ngc15ProfanityFilter17GetContentVersionEv", (void *)ngc_v_one},
         {"_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKcm", (void *)ngc_v_check}, {"_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKDsm", (void *)ngc_v_check},
         {"_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKtm", (void *)ngc_v_check},
         {"_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPcj", (void *)ngc_v_mask}, {"_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPDsj", (void *)ngc_v_mask},
@@ -127,9 +129,12 @@ static void *ngc_vtable(void) {
     // A slot holds SDK code, or the host's version where the loader bound the slot by name to a forced take-over (Initialize, GetContentVersion, CheckProfanityWords): those stay.
     // The table ends at the first value that is neither (Monster Hunter Rise's SDK: 9 slots, then a 1)
     for (; n < NV && (uintptr_t)sdk[2 + n] >= 0x10000; n++) {
-        if (module_of(sdk[2 + n]) != mod) { if (module_of(sdk[2 + n])) break; vt[2 + n] = sdk[2 + n]; continue; }   // another guest module: not this class's table
+        if (module_of(sdk[2 + n]) != mod) { if (module_of(sdk[2 + n])) break; vt[2 + n] = sdk[2 + n]; LOG("ngc: slot %d kept (loader-bound host code %p)", n, sdk[2 + n]); continue; }   // another guest module: not this class's table
         vt[2 + n] = (void *)ngc_v_zero;
-        for (unsigned k = 0; k < sizeof M / sizeof *M; k++) if (addr[k] && sdk[2 + n] == addr[k]) { vt[2 + n] = M[k].fn; named++; break; }
+        int hit = -1;
+        for (unsigned k = 0; k < sizeof M / sizeof *M; k++) if (addr[k] && sdk[2 + n] == addr[k]) { vt[2 + n] = M[k].fn; named++; hit = (int)k; break; }
+        if (hit >= 0) LOG("ngc: slot %d matched %s", n, M[hit].name);
+        else LOG("ngc: slot %d UNMATCHED (sdk %p, returns 0, writes nothing)", n, sdk[2 + n]);
     }
     built = 1; LOG("ngc: ProfanityFilter host vtable of %d slots (%d matched to the class's methods)", n, named);
     return &vt[2];
@@ -139,7 +144,7 @@ HLE_FORCE("_ZN2nn3ngc15ProfanityFilterC1Ev", "profanity filter, the word list is
 }
 HLE_FORCE("_ZN2nn3ngc15ProfanityFilterD1Ev", "profanity filter", void, h_ngc_Dtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn3ngc15ProfanityFilter10InitializeEPvm", "profanity filter init; the host has no word list", Result, h_ngc_Init, void *self, void *work, uint64_t sz) { (void)self; (void)work; (void)sz; return RES_OK; }
-HLE_FORCE("_ZN2nn3ngc15ProfanityFilter17GetContentVersionEv", "word list version; the host returns 0", uint32_t, h_ngc_Ver, void *self) { (void)self; return 0; }
+HLE_FORCE("_ZN2nn3ngc15ProfanityFilter17GetContentVersionEv", "word list version; the host reports version 1 (a version of 0 reads as 'no word list', and games fail closed on it)", uint32_t, h_ngc_Ver, void *self) { (void)self; return 1; }
 HLE_FORCE("_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKcm", "profanity check; never a hit", Result, h_ngc_Check, void *self, uint32_t *masks, uint32_t pat, const char **words, uint64_t n) {
     (void)self; (void)pat; (void)words;
     for (uint64_t i = 0; i < n; i++) masks[i] = 0;
@@ -152,6 +157,9 @@ HLE_FORCE("_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPtj", "profan
 HLE_FORCE("_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPDsj", "profanity masking (char16_t); nothing is masked", Result, h_ngc_Mask16c, void *self, int *masked, uint16_t *text, uint32_t region) { return ngc_v_mask(self, masked, text, region); }
 HLE_FORCE("_ZN2nn3ngc15ProfanityFilter11SetMaskModeENS1_8MaskModeE", "profanity mask mode; nothing is masked whatever the mode", void, h_ngc_MaskMode, void *self, int mode) { (void)self; (void)mode; }
 HLE_FORCE("_ZN2nn3ngc15ProfanityFilter8FinalizeEv", "profanity filter shutdown; the host mounted no word list", void, h_ngc_Fini, void *self) { (void)self; }
+// The China-region free functions (Story of Seasons: Grand Bazaar checks the player/farm name with these, not the class): the SDK's versions read the word list the host never mounted, so the host answers "no profanity" itself
+HLE_FORCE("_ZN2nn3ngc47CheckProfanityWordsInTextForPlatformRegionChinaEPbPKc", "profanity check (China region); the host has no word list, nothing is profanity", Result, h_ngc_CheckChina, uint8_t *out, const char *text) { (void)text; if (out) *out = 0; return RES_OK; }
+HLE_FORCE("_ZN2nn3ngc46MaskProfanityWordsInTextForPlatformRegionChinaEPc", "profanity masking (China region); nothing is masked", Result, h_ngc_MaskChina, char *text) { (void)text; return RES_OK; }
 
 // ---------- nsd server name resolution / pctl free communication: networking, out of scope ----------
 // Free communication is allowed with local play over the LAN on (hle_ldn.c): Animal Crossing: New Horizons' airport otherwise asks for "Communicating with Others" in Parental Controls

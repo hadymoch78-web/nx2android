@@ -585,10 +585,12 @@ static void ov_fps(VkCommandBuffer cb, int64_t now) {   // one value a row: FPS,
     else if (now - t0 >= 500000000ll) { fps = (int)((double)(n - n0) * 1e9 / (double)(now - t0) + 0.5); t0 = now; n0 = n; }
     char rows[3][16]; int nr = 0, hot[3] = {0};
     if (fps < 0) snprintf(rows[nr++], 16, "FPS --"); else snprintf(rows[nr++], 16, "FPS %d", fps > 999 ? 999 : fps);
-    int soc = -1000, bat = -1000; dm_android_temps(&soc, &bat);   // front_android.c: the chip's hottest CPU / GPU zone and the battery, whole degrees C (-1000: not known)
+    // DM_FPS_TEMPS=0 hides the temperature rows (the FPS row stays): the counter is only the frame rate then
+    static int show_temps = -1; if (show_temps < 0) { const char *e = getenv("DM_FPS_TEMPS"); show_temps = !(e && !atoi(e)); }
+    int soc = -1000, bat = -1000; if (show_temps) dm_android_temps(&soc, &bat);   // front_android.c: the chip's hottest CPU / GPU zone and the battery, whole degrees C (-1000: not known)
     // red from where it is dangerously hot: the chip at 80 C (phones throttle hard in the high 80s), the battery at 45 C (Android's warnings and charging limits)
-    if (soc > -100 && soc < 1000) { hot[nr] = soc >= 80; snprintf(rows[nr++], 16, "SOC %dC", soc); }
-    if (bat > -100 && bat < 1000) { hot[nr] = bat >= 45; snprintf(rows[nr++], 16, "BAT %dC", bat); }
+    // if (soc > -100 && soc < 1000) { hot[nr] = soc >= 80; snprintf(rows[nr++], 16, "SOC %dC", soc); }
+    // if (bat > -100 && bat < 1000) { hot[nr] = bat >= 45; snprintf(rows[nr++], 16, "BAT %dC", bat); }
     float k = (float)g_sext.width / g_ov.w, cw = ov_fps_cell() * k, ch = (float)g_ov.gh * k, m = (float)g_sext.height * 0.02f, pad = ch * 0.2f, lh = ch * 1.1f;
     float bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1], gy = (float)(g_ov.h + g_ov.sh + g_ov.ph); size_t wmax = 0;
     for (int r = 0; r < nr; r++) if (strlen(rows[r]) > wmax) wmax = strlen(rows[r]);
@@ -946,7 +948,7 @@ static int shot_wanted(uint64_t n) {
     for (const char *p = e; *p;) { char *end; unsigned long long v = strtoull(p, &end, 10); if (end == p) break; if (v == n) return 1; p = *end == ',' ? end + 1 : end; }
     return 0;
 }
-static void shot(vkimg_t *im, uint64_t n) {
+static int shot_path(vkimg_t *im, const char *path) {   // read the image back and write it as a proper RGB P6; 1 on success
     void mtl_sub_begin(void); uint64_t mtl_sub_commit(void); int mtl_wait(uint64_t, uint64_t);
     uint32_t w = im->w, h = im->h; VkBuffer sb; VkDeviceSize so;
     mtl_sub_begin();
@@ -955,16 +957,19 @@ static void shot(vkimg_t *im, uint64_t n) {
     VkBufferImageCopy c = {so, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
     vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, sb, 1, &c);
     mtl_wait(mtl_sub_commit(), ~0ull);
-    const char *dir = getenv("DM_VK_SHOT_DIR"); if (!dir) dir = getenv("DM_ROOT"); if (!dir) dir = ".";
-    char path[1024]; snprintf(path, sizeof path, "%s/frame_%06llu.ppm", dir, (unsigned long long)n);
     FILE *f = fopen(path, "wb");
-    if (!f) { VKLOG("[RED] cannot write %s", path); return; }
+    if (!f) { VKLOG("[RED] cannot write %s", path); return 0; }
     fprintf(f, "P6\n%u %u\n255\n", w, h);
     int bgra = im->fmt == VK_FORMAT_B8G8R8A8_UNORM || im->fmt == VK_FORMAT_B8G8R8A8_SRGB;
     uint8_t *row = malloc((size_t)w * 3);
     for (uint32_t y = 0; y < h; y++) { const uint8_t *s = p + (size_t)y * w * 4; for (uint32_t x = 0; x < w; x++) { row[3 * x] = s[4 * x + (bgra ? 2 : 0)]; row[3 * x + 1] = s[4 * x + 1]; row[3 * x + 2] = s[4 * x + (bgra ? 0 : 2)]; } fwrite(row, 1, (size_t)w * 3, f); }
     free(row); fclose(f);
-    VKLOG("frame %llu written to %s (%ux%u)", (unsigned long long)n, path, w, h);
+    return 1;
+}
+static void shot(vkimg_t *im, uint64_t n) {
+    const char *dir = getenv("DM_VK_SHOT_DIR"); if (!dir) dir = getenv("DM_ROOT"); if (!dir) dir = ".";
+    char path[1024]; snprintf(path, sizeof path, "%s/frame_%06llu.ppm", dir, (unsigned long long)n);
+    if (shot_path(im, path)) VKLOG("frame %llu written to %s (%ux%u)", (unsigned long long)n, path, im->w, im->h);
 }
 static pthread_mutex_t g_present_mu = PTHREAD_MUTEX_INITIALIZER;   // the swapchain against the window going away (vk_window_lost, on the main thread)
 void vk_window_lost(void) { pthread_mutex_lock(&g_present_mu); swap_destroy(); g_win = NULL; pthread_mutex_unlock(&g_present_mu); }
@@ -1062,7 +1067,17 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) { undrawn++; return present_enqueue(NULL, NULL, n, period); }   // never drawn into: nothing to show yet
     shown++; atomic_fetch_add(&g_fps_frames, 1);
     if (shot_wanted(n)) shot(im, n);
-    { void vk_pass_dump_poll(uint64_t done); uint64_t vk_fence_done(void); vk_pass_dump_poll(vk_fence_done()); void vk_pass_frame(void); vk_pass_frame(); void vk_tex_sweep(void); vk_tex_sweep(); }
+    {   // DM_DUMP_PRESENT=1: the third of the three readback dumps (the scene and UI dumps are recorded at pass end, gfx_vk_exec.c): read back
+        // the presented texture of the target present (the first present after 30) before the present path scales it into the swapchain image.
+        // Black bars already in the dumps mean the game rendered the box; a full dump means the host present path added it.
+        void vk_dump_arm(uint64_t n); uint64_t vk_dump_target(void); static int done;
+        vk_dump_arm(n);
+        const char *e = getenv("DM_DUMP_PRESENT");
+        if (!done && e && atoi(e) && n == vk_dump_target()) { done = 1; const char *dir = getenv("DM_VK_SHOT_DIR"); if (!dir) dir = getenv("DM_ROOT"); if (!dir) dir = ".";
+            char path[1024]; snprintf(path, sizeof path, "%s/dump_%llu_prepresent.ppm", dir, (unsigned long long)n);
+            if (shot_path(im, path)) VKLOG("dump: present %llu prepresent %ux%u -> %s", (unsigned long long)n, im->w, im->h, path); } }
+    if (n == 30) { void dm_evt8_dump(void); dm_evt8_dump(); }   // the HLE display-event ring, once (silent unless DM_LOG_VI_ARGS=1)
+    { void vk_pass_dump_poll(uint64_t done); uint64_t vk_fence_done(void); vk_pass_dump_poll(vk_fence_done()); void vk_dump_present_poll(uint64_t done); vk_dump_present_poll(vk_fence_done()); void vk_pass_frame(void); vk_pass_frame(); void vk_tex_sweep(void); vk_tex_sweep(); }
     if (n % 1800 == 0) {   // every ~30 s: the pipeline cache to disk on a thread of its own (an Android app can be killed without any exit path)
         void vk_pipeline_cache_save(void); pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
         pthread_create(&th, &a, (void *(*)(void *))(void *)vk_pipeline_cache_save, NULL); pthread_attr_destroy(&a);

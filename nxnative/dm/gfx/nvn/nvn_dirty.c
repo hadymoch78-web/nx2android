@@ -4,11 +4,13 @@
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
 #include "nvn_dirty.h"
 #include "../../host/dm.h"
+#include "../../host/dm_uc.h"   // DM_UC_SS: the faulting PC/LR/FP from the signal context
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
+#include <mach/mach.h>   // vm_read_overwrite: reads that fail instead of faulting (process_vm_readv on Android)
 #include <sched.h>
 
 // Order of page state and mprotect: the side changing protection first sets the state to BUSY and sets the final state only after mprotect has landed; other threads wait when they see BUSY.
@@ -98,9 +100,67 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     }
 }
 static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t *count);
+// ---------- Write watch on a rectangle (DM_WATCH_RECT) ----------
+// Diagnostic: find where a game's view rectangle lives and who writes it. DM_WATCH_RECT=<x0,y0,x1,y1> (four int32, e.g. 160,0,1440,720) scans guest
+// memory once, at one present (DM_WATCH_RECT_AT, default 30), for the 16-byte little-endian pattern, and write-protects every writable page holding a
+// match through the same ranges and fault path as texture tracking (a watched page is a tracked range: a game write faults, on_fault records the writer
+// and lets it through as any other). The fault handler only records (signal context: atomics, plain stores and fail-instead-of-fault reads, no logging);
+// dm_watch_tick, on the present thread, logs each hit once with the writer's PC and LR, the frame-pointer chain (so a hit in a generic stp/memcpy
+// still names the caller a few frames up) and the values before and after the write. Each address records up to WATCH_HITS writes: after a hit is
+// logged the tick re-arms the page so the next write faults again, until the ring is full (short arm). A page the tracker releases without a fault (a
+// host write into it, a texture sweep over it) is re-protected by the tick. The scan reads /proc/self/maps, so it runs on Linux (Android) only;
+// elsewhere the tick logs that and arms nothing. DM_WATCH_SCAN_ONLY=1 turns the watch into a read-only probe: the scan still runs and each match is
+// still logged, but instead of arming, the 128 qwords before each match (0x400 bytes back) and the 16 after it are dumped as `scan:` lines, so the
+// enclosing object's vtable pointer can be found offline. Nothing is write-protected, so the arming race that crashed the game twice cannot happen;
+// the game continues normally afterwards.
+enum { WATCH_MAX = 16, WATCH_HITS = 10, WATCH_FRAMES = 8 };
+typedef struct {   // one recorded write: the writer's PC and LR, the frame-pointer chain (return addresses, [fp+8] per frame), the values before the write
+    uint64_t pc, lr, fp[WATCH_FRAMES]; int nfp; int32_t old[4]; _Atomic int ready;   // ready: set (release) once the rest is written
+} watch_hit_t;
+typedef struct { uintptr_t addr; _Atomic int claimed, logged; watch_hit_t hits[WATCH_HITS]; } watch_t;   // claimed: next slot to claim; logged: next slot to log
+static watch_t g_watch[WATCH_MAX];
+static _Atomic int g_watch_n;   // watches armed; 0 = the fault path skips the check
+static int g_watch_scan_only;   // DM_WATCH_SCAN_ONLY=1: dump the context around each match, never arm (read-only probe)
+// Walk the frame-pointer chain from the faulting context: up to max return addresses ([fp+8] of each frame). Signal context: the reads go through
+// vm_read_overwrite (fails instead of faulting on an unmapped frame), the loop is bounded, and every frame is sanity-checked (8-byte aligned, strictly
+// increasing, within 64 KB of the previous) so a garbage chain stops the walk instead of crashing the game. Returns the frames found.
+static int watch_fp_chain(void *uc, uint64_t *out, int max) {
+    uintptr_t fp = (uintptr_t)DM_UC_SS((ucontext_t *)uc)->__fp;
+    int n = 0;
+    while (n < max && fp) {
+        if (fp & 7) break;   // not 8-byte aligned: not a frame pointer
+        uint64_t pair[2]; vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, 16, (vm_address_t)pair, &got) != KERN_SUCCESS || got != 16) break;   // unreadable frame: stop
+        uintptr_t next = (uintptr_t)pair[0];
+        if (next && (next <= fp || next - fp > 64 * 1024)) break;   // the chain walks up the stack, one frame at a time
+        out[n++] = pair[1];   // the caller's return address
+        fp = next;
+    }
+    return n;
+}
+// A write fault on a watched address: claim a hit slot and record the writer's PC and LR, the frame-pointer chain, and the values before the write
+// (the store has not landed yet). Signal context: atomics, plain stores and fail-instead-of-fault reads only; the present thread logs it (dm_watch_tick).
+static void watch_fault(uintptr_t a, void *uc) {
+    int n = atomic_load_explicit(&g_watch_n, memory_order_acquire);
+    if (!n) return;
+    for (int i = 0; i < n; i++) {
+        watch_t *w = &g_watch[i];
+        if (a < w->addr || a >= w->addr + sizeof w->hits[0].old) continue;
+        int slot = atomic_fetch_add_explicit(&w->claimed, 1, memory_order_relaxed);
+        if (slot >= WATCH_HITS) return;   // the ring is full: no more recording
+        watch_hit_t *h = &w->hits[slot];
+        struct __darwin_arm_thread_state64 *ss = DM_UC_SS((ucontext_t *)uc);
+        h->pc = ss->__pc;
+        h->lr = ss->__lr;
+        h->nfp = watch_fp_chain(uc, h->fp, WATCH_FRAMES);
+        memcpy(h->old, (const void *)w->addr, sizeof h->old);   // the page is read-only: reads are fine
+        atomic_store_explicit(&h->ready, 1, memory_order_release);
+        return;
+    }
+}
 static int on_fault(void *addr, int is_write, void *uc) {
-    (void)uc;
     if (!is_write) return 0;
+    watch_fault((uintptr_t)addr, uc);
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++) {   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         range_t *r = rg(i); if (!live_at(i) || a < r->base || a >= r->end) continue;
@@ -251,10 +311,22 @@ int nvn_dirty_tracked(const void *addr, size_t len) {
 }
 // The tracked range holding [addr, addr+len), as a handle a caller keeps (packaged textures: the scan over every range ran twice per texture lookup). NULL = untracked
 const void *nvn_dirty_span(const void *addr, size_t len) { return len ? find_span((uintptr_t)addr, len) : NULL; }
-// Set read-only: mark the pages BUSY first and mark them PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file)
+// Set read-only: mark the pages BUSY first and mark them PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file).
+// The lookup and the whole call run under g_slot_mu: without it, the pool owning the range found could be retired and its slot taken by another pool between the
+// lookup and the state accesses, and the page indices (computed from the new range's base) would run past that range's state array (heap corruption; the rect watch's
+// arming hit it at a game's load, when pools churn). The fault handler never takes the mutex, and this call waits on nothing while holding it, so it cannot deadlock.
 void nvn_dirty_protect(const void *addr, size_t len) {
-    range_t *r = len ? find_span((uintptr_t)addr, len) : NULL;
-    if (!r) return;
+    if (!len) return;
+    pthread_mutex_lock(&g_slot_mu);
+    range_t *r = find_span((uintptr_t)addr, len);
+    if (!r) {
+        // MotoGP 18 2048 diag: a texture whose span is not inside any single tracked
+        // range is NEVER write-protected, so CPU writes to it never fault and the host
+        // never learns the game wrote it. Log large spans only (a 2048 BC3 is 5.6 MB).
+        if (len >= (1u << 20)) { static int n; if (n++ < 40) LOG("[dm] [vk] dirty-protect: NO tracked range holds [%p, +%#zx) (%zu MB): NOT protected, CPU writes invisible", addr, len, len >> 20); }
+        pthread_mutex_unlock(&g_slot_mu);
+        return;
+    }
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     // Consecutive pages are merged into one mprotect (per-page calls reach thousands per frame on the first upload of large textures; character select page startup frame 5: 4888 calls).
     // Pages already PROT / BUSY break the consecutive run: do not protect again, and do not touch pages another thread is changing
@@ -265,6 +337,7 @@ void nvn_dirty_protect(const void *addr, size_t len) {
         if (took && !open) { run = i; open = 1; }
         if (!took && open) { atomic_fetch_add(&r->nmp, 1); mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) { atomic_store(&r->span[k], (uint32_t)p + 1); atomic_store(&r->state[k], PG_PROT); } open = 0; }
     }
+    pthread_mutex_unlock(&g_slot_mu);
 }
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp) {
@@ -287,4 +360,358 @@ void nvn_dirty_stats(uint64_t *faults, uint64_t *preps) { *faults = atomic_load(
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     *calls = atomic_load(&g_mp_calls); *pages = atomic_load(&g_mp_pages); *ns = atomic_load(&g_mp_ticks) * tb.numer / tb.denom;
+}
+
+#if defined(__linux__)
+// Scan every readable mapping for the 16-byte pattern (4-byte aligned: it is a struct of four int32). Reads go through vm_read_overwrite, which fails
+// instead of faulting when a region is unmapped mid-scan. found[] takes the matches (at most max); wr[] says whether the match's page is writable;
+// region[] the /proc/self/maps region each match sits in (the file path, a bracketed name like [stack], or "anon" for an anonymous mapping).
+// Returns the matches found, or -1 when the maps could not be read. One pass, 1 MB chunks with the last 16 bytes carried over so a match straddling
+// a chunk boundary is still found (matches fully inside the carried prefix were found in the previous chunk and are skipped).
+static int watch_scan(const int32_t pat[4], uintptr_t *found, uint8_t *wr, char (*region)[64], int max) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return -1;
+    uint8_t *buf = malloc(1 << 20);
+    if (!buf) { fclose(f); return -1; }
+    int n = 0;
+    char line[512];
+    while (fgets(line, sizeof line, f) && n < max) {
+        unsigned long lo, hi; char perms[5], path[64];
+        int flds = sscanf(line, "%lx-%lx %4s %*lx %*31s %*lu %63s", &lo, &hi, perms, path);
+        if (flds < 3) continue;
+        if (perms[0] != 'r') continue;
+        if (strstr(line, "[vdso]") || strstr(line, "[vvar]") || strstr(line, "[vsyscall]")) continue;
+        int w = perms[1] == 'w';
+        uintptr_t base = lo; size_t carry = 0;
+        while (base < hi && n < max) {
+            size_t room = (1 << 20) - carry, want = hi - base < room ? (size_t)(hi - base) : room;
+            vm_size_t got = 0;
+            if (vm_read_overwrite(mach_task_self(), (vm_address_t)base, want, (vm_address_t)(buf + carry), &got) != KERN_SUCCESS || got != want) break;   // unreadable part: skip the rest of this mapping
+            size_t total = carry + want;
+            uintptr_t start = base - carry;   // the address of buf[0]
+            for (size_t o = 0; o + 16 <= total; o += 4) {
+                if (o + 16 <= carry) continue;
+                int32_t v; memcpy(&v, buf + o, 4);
+                if (v != pat[0] || memcmp(buf + o, pat, 16)) continue;
+                found[n] = start + o; wr[n] = (uint8_t)w; snprintf(region[n], 64, "%s", flds == 4 ? path : "anon"); n++;
+                if (n >= max) break;
+            }
+            if (n >= max || base + want >= hi) break;
+            memmove(buf, buf + total - 16, 16);   // carry the last 16 bytes (total is large here: the mapping continues, so want filled the room)
+            base += want; carry = 16;
+        }
+    }
+    free(buf); fclose(f);
+    return n;
+}
+#endif
+// Write-protect the pages holding [addr, addr+16): register each page as a tracked range when no range holds it yet, then protect the covered part.
+// A range of its own keeps the watch independent of pool lifetimes; a page already tracked (a pool's) is protected through that range.
+static void watch_arm(uintptr_t addr) {
+    uintptr_t pg = (uintptr_t)getpagesize();
+    uintptr_t first = addr & ~(pg - 1), last = (addr + 15) & ~(pg - 1);
+    for (uintptr_t p = first; p <= last; p += pg) {
+        uintptr_t lo = addr > p ? addr : p, hi = addr + 16 < p + pg ? addr + 16 : p + pg;
+        if (!nvn_dirty_tracked((const void *)p, pg)) nvn_dirty_add_range((const void *)p, pg);
+        nvn_dirty_protect((const void *)lo, hi - lo);
+    }
+}
+// Is the page holding addr still read-only in a range tracking it (1), or writable / untracked (0)? Releases update every range over a page, so any
+// range saying PROT means the page is read-only; all saying NONE means it was released. Under g_slot_mu: a slot retired and reused mid-scan would give
+// the page index of another range's base, past that range's state array (the same race nvn_dirty_protect had).
+static int watch_protected(uintptr_t addr) {
+    uintptr_t pg = (uintptr_t)getpagesize(), p = addr & ~(pg - 1);
+    pthread_mutex_lock(&g_slot_mu);
+    int n = atomic_load(&g_nr), prot = 0;
+    for (int i = 0; i < n; i++) {
+        range_t *r = rg(i);
+        if (!live_at(i) || p < r->base || p >= r->end) continue;
+        if (atomic_load(&r->state[(p - r->base) >> g_shift]) == PG_PROT) { prot = 1; break; }
+    }
+    pthread_mutex_unlock(&g_slot_mu);
+    return prot;
+}
+// The rectangle's current values, read safely (the object may have been freed since the hit).
+static int watch_read(uintptr_t addr, int32_t out[4]) {
+    vm_size_t got = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)addr, 16, (vm_address_t)out, &got) == KERN_SUCCESS && got == 16;
+}
+#if defined(__linux__)
+// Scan-only mode (DM_WATCH_SCAN_ONLY=1): dump the qwords around a match — the 128 before it (0x400 bytes back), the match itself, and the 16 after
+// it — one qword per line, so the enclosing object's vtable pointer (a pointer into the .rodata vtable range, up to 0x400 bytes back) can be
+// identified offline. Reads go through vm_read_overwrite one qword at a time, which fails instead of faulting on an unmapped address; nothing is
+// write-protected, so this path cannot hit the arming race. Runs on the present thread (dm_watch_tick), not signal context.
+static void watch_dump_context(uintptr_t addr) {
+    uintptr_t first = addr >= 0x400 ? addr - 0x400 : 0;   // the match is never this low, but never wrap the address
+    for (uintptr_t a = first; a < addr + 16 + 128; a += 8) {
+        uint64_t v; vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)a, 8, (vm_address_t)&v, &got) == KERN_SUCCESS && got == 8)
+            LOG("scan: 0x%llx: 0x%llx", (unsigned long long)a, (unsigned long long)v);
+        else
+            LOG("scan: 0x%llx: <unreadable>", (unsigned long long)a);
+    }
+}
+static void watch_scan_and_arm(const int32_t pat[4]) {
+    uintptr_t found[WATCH_MAX]; uint8_t wr[WATCH_MAX]; char region[WATCH_MAX][64];
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+    int n = watch_scan(pat, found, wr, region, WATCH_MAX);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (n < 0) { LOG("[RED] watch: cannot read /proc/self/maps, nothing armed"); return; }
+    LOG("watch: scanned guest memory in %.0f ms: %d match%s for {%d,%d,%d,%d}%s", ms, n, n == 1 ? "" : "es", pat[0], pat[1], pat[2], pat[3], n >= WATCH_MAX ? " (capped)" : "");
+    if (!n) { LOG("watch: no match (the rectangle may not exist yet: retry with a later DM_WATCH_RECT_AT)"); return; }
+    // Fill the table and publish it before protecting any page: a fault can only happen after the mprotect, by which time the table is visible.
+    int armed = 0;
+    for (int i = 0; i < n; i++) {
+        LOG("watch: match %#llx for {%d,%d,%d,%d} in %s", (unsigned long long)found[i], pat[0], pat[1], pat[2], pat[3], region[i]);   // before arming: if arming fails, the address is still in the log
+        if (g_watch_scan_only) { watch_dump_context(found[i]); continue; }   // read-only probe: dump the context, never arm
+        if (!wr[i]) { LOG("watch: match at %#llx is in a read-only mapping, not watched", (unsigned long long)found[i]); continue; }
+        if (!strncmp(region[i], "[stack", 6)) { LOG("watch: match at %#llx is on a stack page (a short-lived copy): not armed", (unsigned long long)found[i]); continue; }   // a local or an argument, gone when the function returns: it cannot catch the writer that matters
+        watch_t *w = &g_watch[armed];
+        w->addr = found[i];
+        atomic_store_explicit(&w->claimed, 0, memory_order_relaxed);
+        atomic_store_explicit(&w->logged, 0, memory_order_relaxed);
+        for (int k = 0; k < WATCH_HITS; k++) atomic_store_explicit(&w->hits[k].ready, 0, memory_order_relaxed);
+        armed++;
+    }
+    if (g_watch_scan_only) { LOG("watch: scan-only mode (DM_WATCH_SCAN_ONLY=1): %d match%s dumped, nothing armed", n, n == 1 ? "" : "es"); return; }   // g_watch_n stays 0: the fault path and the tick skip the watch entirely
+    atomic_store_explicit(&g_watch_n, armed, memory_order_release);
+    for (int i = 0; i < armed; i++) {
+        watch_arm(g_watch[i].addr);
+        if (!watch_protected(g_watch[i].addr)) LOG("[RED] watch: %#llx could not be write-protected (the tick retries it)", (unsigned long long)g_watch[i].addr);
+        else LOG("watch: armed %#llx", (unsigned long long)g_watch[i].addr);
+    }
+    if (!armed) LOG("watch: nothing armed");
+}
+#endif
+// Log each recorded hit once (with the values after the write, read now), re-arm the page after a logged hit so the next write faults again (until
+// the ring is full), and re-protect watches whose pages the tracker released without a fault.
+static void watch_report(uint64_t presents) {
+    int n = atomic_load_explicit(&g_watch_n, memory_order_acquire);
+    for (int i = 0; i < n; i++) {
+        watch_t *w = &g_watch[i];
+        int logged = atomic_load_explicit(&w->logged, memory_order_relaxed);
+        int progress = 0;
+        while (logged < WATCH_HITS && atomic_load_explicit(&w->hits[logged].ready, memory_order_acquire)) {   // in order: a later slot may be ready first
+            watch_hit_t *h = &w->hits[logged];
+            int32_t now[4];
+            char after[64];
+            if (watch_read(w->addr, now)) snprintf(after, sizeof after, "{%d,%d,%d,%d}", now[0], now[1], now[2], now[3]);
+            else snprintf(after, sizeof after, "(unreadable now)");
+            char pcs[96], lrs[96], chain[512]; size_t clen = 0; chain[0] = 0;   // PC, LR and the FP chain as module-relative offsets (a raw address outside any module)
+            module_t *m = module_of((const void *)h->pc);
+            if (m) snprintf(pcs, sizeof pcs, "%s+%#llx", m->name, h->pc - (uint64_t)m->base);
+            else snprintf(pcs, sizeof pcs, "%#llx", (unsigned long long)h->pc);
+            module_t *lm = module_of((const void *)h->lr);
+            if (lm) snprintf(lrs, sizeof lrs, "%s+%#llx", lm->name, h->lr - (uint64_t)lm->base);
+            else snprintf(lrs, sizeof lrs, "%#llx", (unsigned long long)h->lr);
+            for (int f = 0; f < h->nfp && clen < sizeof chain - 1; f++) {
+                module_t *fm = module_of((const void *)h->fp[f]);
+                int wlen;
+                if (fm) wlen = snprintf(chain + clen, sizeof chain - clen, "%s%s+%#llx", f ? " " : "", fm->name, h->fp[f] - (uint64_t)fm->base);
+                else wlen = snprintf(chain + clen, sizeof chain - clen, "%s%#llx", f ? " " : "", (unsigned long long)h->fp[f]);
+                if (wlen > 0) clen += (size_t)wlen;
+            }
+            LOG("watch: write to rect %#llx at present %llu (hit %d/%d): writer pc %s lr %s, values {%d,%d,%d,%d} -> %s, fp: %s", (unsigned long long)w->addr,
+                (unsigned long long)presents, logged + 1, WATCH_HITS, pcs, lrs,
+                h->old[0], h->old[1], h->old[2], h->old[3], after, h->nfp ? chain : "(none)");
+            atomic_store_explicit(&w->logged, ++logged, memory_order_relaxed);
+            progress = 1;
+        }
+        if (progress) {
+            if (logged < WATCH_HITS) {   // a hit was logged: re-arm for the next write
+                watch_arm(w->addr);
+                if (!watch_protected(w->addr)) LOG("[RED] watch: %#llx could not be re-protected after hit %d", (unsigned long long)w->addr, logged);
+            } else LOG("watch: %#llx recorded %d hits, done", (unsigned long long)w->addr, WATCH_HITS);   // short arm: the ring is full
+            continue;
+        }
+        if (logged >= WATCH_HITS) continue;   // done: no re-protecting a finished watch
+        // No hit yet: the tracker may have released the page without a fault (a host write, a texture sweep). Re-protect it, checked every 60 presents.
+        if (presents % 60 == 0 && !watch_protected(w->addr)) {
+            watch_arm(w->addr);
+            LOG("watch: %#llx was writable again without a hit, re-protected at present %llu", (unsigned long long)w->addr, (unsigned long long)presents);
+        }
+    }
+}
+void dm_watch_tick(uint64_t presents) {
+    static int state;   // 0 = not read yet, -1 = off, 1 = waiting for the scan present, 2 = scanned (armed, or dumped in scan-only mode)
+    static uint64_t at; static int32_t pat[4];
+    if (!state) {
+        state = -1;
+        const char *e = getenv("DM_WATCH_RECT");
+        if (!e || !*e) return;
+        if (sscanf(e, "%d,%d,%d,%d", &pat[0], &pat[1], &pat[2], &pat[3]) != 4) { LOG("[RED] DM_WATCH_RECT=%s: want four integers x0,y0,x1,y1", e); return; }
+        const char *a = getenv("DM_WATCH_RECT_AT");
+        at = a ? strtoull(a, NULL, 10) : 30;
+        if (!at) at = 1;
+        { const char *s = getenv("DM_WATCH_SCAN_ONLY"); g_watch_scan_only = s && atoi(s); }
+        state = 1;
+        LOG("watch: DM_WATCH_RECT={%d,%d,%d,%d}, scanning at present %llu%s", pat[0], pat[1], pat[2], pat[3], (unsigned long long)at, g_watch_scan_only ? " (scan-only: no arming)" : "");
+    }
+    if (state == 1 && presents >= at) {
+        state = 2;
+#if defined(__linux__)
+        watch_scan_and_arm(pat);
+#else
+        LOG("watch: the memory scan needs Linux (/proc/self/maps); nothing armed on this platform");
+#endif
+    }
+    if (state != 2) return;
+    watch_report(presents);
+}
+
+// ---------- Box poke (DM_POKE_BOX) ----------
+// A game whose menus are laid out in a box narrower than the framebuffer (MotoGP 18: a 1280-wide box centred in a 1600-wide viewport, while the race
+// is fullscreen) keeps the box in a live value the code does not spell out as a constant: the size getter already returns the full width, no code site
+// holds the narrow width, and no scissor or viewport is narrowed. DM_POKE_BOX=1 finds the box values in guest memory at run time and overwrites them
+// with the fullscreen values at the start of every present, so a layout pass that rewrites them each frame is corrected again before the next frame
+// is drawn. Four patterns, each 16 bytes (built from typed literals, never byte strings):
+//   float {0.1, 0, 0.8, 1} -> {0, 0, 1, 1}            (a normalised origin/size quad, e.g. ULocalPlayer)
+//   int   {160, 0, 1440, 720} -> {0, 0, 1600, 720}    (a pixel rect, max form)
+//   int   {160, 0, 1280, 720} -> {0, 0, 1600, 720}    (a pixel rect, size form)
+//   float {160, 0, 1440, 720} -> {0, 0, 1600, 720}    (a pixel rect as floats)
+// The scan covers GUEST memory only: the guest address block (heap, alias region) and the loaded modules' images (data/BSS). Host mappings are never
+// scanned, so the host's own copy of the rect (gfx_vk_exec.c g_pass_bb, a per-pass telemetry bounding box in libdmhost.so's .bss) cannot match —
+// poking it would do nothing, it is recomputed from the draws every pass. Guest thread stacks are skipped too (a rect on a stack is a transient copy,
+// gone when the function returns). Only writable mappings are scanned: a match in read-only memory could not be poked anyway, and is counted and
+// reported separately. Guard: if the four patterns match more than POKE_MAX addresses in total, nothing is poked — the values are too common to trust
+// any one of them. A poke writes only when the address still holds the box pattern (read back first): an address the game freed and reused, or one
+// already poked, is left alone. Runs on the present thread (dm_poke_tick), Linux only (/proc/self/maps).
+enum { POKE_NPAT = 4, POKE_MAX = 4, POKE_CAP = 16, POKE_RETRIES = 5, POKE_RETRY_EVERY = 600, POKE_FIRST = 30 };
+#if defined(__linux__)
+int dm_guest_as_contains(uintptr_t a);      // hle_svc.c
+int dm_guest_stack_contains(uintptr_t a);   // hle_svc.c
+typedef struct { const char *name; const void *orig, *repl; } poke_pat_t;
+static const float poke_f0_orig[4] = { 0.1f, 0.0f, 0.8f, 1.0f };
+static const float poke_f0_repl[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+static const int32_t poke_i1_orig[4] = { 160, 0, 1440, 720 };
+static const int32_t poke_i1_repl[4] = { 0, 0, 1600, 720 };
+static const int32_t poke_i2_orig[4] = { 160, 0, 1280, 720 };
+static const int32_t poke_i2_repl[4] = { 0, 0, 1600, 720 };
+static const float poke_f3_orig[4] = { 160.0f, 0.0f, 1440.0f, 720.0f };
+static const float poke_f3_repl[4] = { 0.0f, 0.0f, 1600.0f, 720.0f };
+static const poke_pat_t poke_pats[POKE_NPAT] = {
+    { "float {0.1,0,0.8,1}", poke_f0_orig, poke_f0_repl },
+    { "int {160,0,1440,720}", poke_i1_orig, poke_i1_repl },
+    { "int {160,0,1280,720}", poke_i2_orig, poke_i2_repl },
+    { "float {160,0,1440,720}", poke_f3_orig, poke_f3_repl },
+};
+typedef struct { uintptr_t addr; int pat; char region[64]; } poke_hit_t;
+static poke_hit_t g_poke[POKE_MAX];
+static int g_poke_n;
+// Scan the writable guest mappings for the four box patterns. hits[] takes the matches found (at most POKE_CAP); per[] counts every writable match
+// per pattern (uncapped: the guard needs the true total), ro[] counts matches in read-only mappings, which are reported but never poked. Returns the
+// total writable matches, or -1 when the maps could not be read. One pass, 1 MB chunks with the last 16 bytes carried over (as watch_scan).
+static int poke_scan(poke_hit_t *hits, int per[POKE_NPAT], int ro[POKE_NPAT]) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return -1;
+    uint8_t *buf = malloc(1 << 20);
+    if (!buf) { fclose(f); return -1; }
+    uint32_t first[POKE_NPAT];
+    for (int i = 0; i < POKE_NPAT; i++) memcpy(&first[i], poke_pats[i].orig, 4);   // the first word of each pattern, for the quick check
+    int total = 0, stored = 0;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo, hi; char perms[5];
+        if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) < 3) continue;
+        if (perms[0] != 'r') continue;
+        if (!dm_guest_as_contains(lo) && !module_of((const void *)lo)) continue;   // a host mapping: never scanned (the host's own rect copy lives in one)
+        if (dm_guest_stack_contains(lo) || dm_guest_stack_contains(hi - 1)) continue;   // a guest thread stack: transient copies only
+        int w = perms[1] == 'w';
+        uintptr_t base = lo; size_t carry = 0;
+        while (base < hi) {
+            size_t room = (1 << 20) - carry, want = hi - base < room ? (size_t)(hi - base) : room;
+            vm_size_t got = 0;
+            if (vm_read_overwrite(mach_task_self(), (vm_address_t)base, want, (vm_address_t)(buf + carry), &got) != KERN_SUCCESS || got != want) break;   // unreadable part: skip the rest of this mapping
+            size_t tot = carry + want;
+            uintptr_t start = base - carry;   // the address of buf[0]
+            for (size_t o = 0; o + 16 <= tot; o += 4) {
+                if (o + 16 <= carry) continue;   // fully inside the carried prefix: found in the previous chunk
+                uint32_t v; memcpy(&v, buf + o, 4);
+                for (int p = 0; p < POKE_NPAT; p++) {
+                    if (v != first[p] || memcmp(buf + o, poke_pats[p].orig, 16)) continue;
+                    if (!w) { ro[p]++; break; }   // read-only: counted, never stored
+                    per[p]++; total++;
+                    if (stored < POKE_CAP) {
+                        poke_hit_t *h = &hits[stored++];
+                        h->addr = start + o; h->pat = p;
+                        module_t *m = module_of((const void *)h->addr);
+                        if (m) snprintf(h->region, sizeof h->region, "%s+%#llx", m->name, h->addr - (uint64_t)m->base);
+                        else snprintf(h->region, sizeof h->region, "guest-AS");
+                    }
+                    break;   // the patterns are disjoint: one address matches at most one
+                }
+            }
+            if (base + want >= hi) break;
+            memmove(buf, buf + tot - 16, 16);   // carry the last 16 bytes (total is large here: the mapping continues, so want filled the room)
+            base += want; carry = 16;
+        }
+    }
+    free(buf); fclose(f);
+    return total;
+}
+// One scan attempt: log the counts, cache the matches when the guard passes. Returns 1 when armed, 0 when nothing matched, -1 when the guard tripped.
+static int poke_scan_and_cache(void) {
+    poke_hit_t hits[POKE_CAP]; int per[POKE_NPAT] = { 0 }, ro[POKE_NPAT] = { 0 };
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+    int total = poke_scan(hits, per, ro);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (total < 0) { LOG("[RED] poke: cannot read /proc/self/maps"); return 0; }   // retried like a no-match: the maps may appear later
+    int nro = 0; for (int p = 0; p < POKE_NPAT; p++) nro += ro[p];
+    LOG("poke: scanned guest memory in %.0f ms: %d match%s (%d/%d/%d/%d per pattern)%s", ms, total, total == 1 ? "" : "es",
+        per[0], per[1], per[2], per[3], nro ? " (+ read-only matches skipped)" : "");
+    if (!total) { LOG("poke: no match yet (the box values may not exist until the menu is laid out)"); return 0; }
+    if (total > POKE_MAX) { LOG("poke: %d matches (> %d): poking nothing (guard)", total, POKE_MAX); return -1; }
+    for (int i = 0; i < total; i++) {
+        g_poke[i] = hits[i];
+        LOG("poke: %s at %#llx in %s", poke_pats[hits[i].pat].name, (unsigned long long)hits[i].addr, hits[i].region);
+    }
+    g_poke_n = total;
+    LOG("poke: armed %d address%s, poking at the start of every present", total, total == 1 ? "" : "es");
+    return 1;
+}
+// Overwrite every cached address that still holds its box pattern. The game may rewrite the values each frame (a layout pass), so the poke runs
+// every present; the read-back first means an address already poked, or freed and reused for something else, is left alone. A poke into a page the
+// dirty tracker write-protected is released first (prep_write); a fault between the release and the store still goes through the tracker's fault path,
+// which releases the page and lets the write through. The 16-byte store is not atomic against the game's own writes, but a torn write lasts one frame:
+// the next present pokes it again. Logs each write for the first 10 presents after arming, then every 600th present only.
+static void poke_apply(uint64_t presents, uint64_t armed_at) {
+    int log = presents - armed_at < 10 || presents % 600 == 0;
+    for (int i = 0; i < g_poke_n; i++) {
+        const poke_pat_t *pat = &poke_pats[g_poke[i].pat];
+        uint8_t cur[16]; vm_size_t got = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)g_poke[i].addr, 16, (vm_address_t)cur, &got) != KERN_SUCCESS || got != 16) continue;   // freed or unmapped since the scan
+        if (memcmp(cur, pat->orig, 16)) continue;   // already poked, or repurposed: leave it
+        prep_write((void *)g_poke[i].addr, 16);
+        memcpy((void *)g_poke[i].addr, pat->repl, 16);
+        if (log) LOG("poke: %#llx %s -> fullscreen at present %llu", (unsigned long long)g_poke[i].addr, pat->name, (unsigned long long)presents);
+    }
+}
+#endif
+void dm_poke_tick(uint64_t presents) {
+    static int state;   // 0 = not read yet, -1 = off/done, 1 = waiting for a scan, 2 = armed (poking every present)
+    static int retries; static uint64_t next_scan, armed_at;
+    if (!state) {
+        state = -1;
+        const char *e = getenv("DM_POKE_BOX");
+        if (!e || !atoi(e)) return;
+        state = 1; retries = 0; next_scan = POKE_FIRST;
+        LOG("poke: DM_POKE_BOX=1, scanning guest memory at present %d", POKE_FIRST);
+    }
+    if (state == 1 && presents >= next_scan) {
+#if defined(__linux__)
+        int r = poke_scan_and_cache();
+        if (r == 1) { state = 2; armed_at = presents; }
+        else if (++retries > POKE_RETRIES) { state = -1; LOG("poke: giving up after %d scans, nothing poked", POKE_RETRIES + 1); }
+        else next_scan = presents + POKE_RETRY_EVERY;
+#else
+        state = -1;
+        LOG("poke: the memory scan needs Linux (/proc/self/maps); nothing poked on this platform");
+#endif
+    }
+    if (state != 2) return;
+#if defined(__linux__)
+    poke_apply(presents, armed_at);
+#endif
 }

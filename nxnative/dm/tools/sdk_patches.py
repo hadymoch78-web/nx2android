@@ -204,4 +204,15 @@ CUTS = {
     (0x336b50, 'e9230b32', '097ca052', 'AddressRegionManager constructor: node area limit orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000'),
     (0x336bf0, 'e9230b32', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region orr w9,wzr,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
+  # Harvest Moon: The Winds of Anthos 1.0.0 (v0) sdk (SDK 14.3.0, Unity 2022.1.3f1): the same node area cut as Engage's. nninitStartup's
+  # StandardAllocator::Initialize(nullptr, pool − used) reserves 3.14 GB, which the 1 GB alignment put at +1.00 GB after the 1 GB node area
+  # and ended at +4.14 GB of the 4.375 GB alias region, so Unity's AllocateAddressRegion calls were refused 0x1803 and the game crashed
+  # (sig 11, addr 0xffffe0) in its TLSF heap at boot. The constructor is at sdk+0x12d8a0 (limit = alias start + 0x3fe00000 at +0x10, a unit
+  # heap of 0x30-byte nodes, the area then registered as occupied at +0x12d94c); VammManager::AllocateAddressRegion at sdk+0x12da9c aligns a
+  # region by its size (1 GB from 1 GB up) and takes the same 32 MB cut as Unpacking's SDK 13.3.2 build.
+  '2aef2cffb104ee7c9e212fd2f4c731e9': [
+    (0x12d8b0, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
+    (0x12d94c, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
+    (0x12daac, '0a00a852', '0a40a052', 'AllocateAddressRegion: alignment of regions of 1 GB and more mov w10,#0x40000000 → mov w10,#0x2000000 (32 MB, as from 32 MB up)'),
+  ],
 }

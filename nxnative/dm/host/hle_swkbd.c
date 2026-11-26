@@ -4,6 +4,11 @@
 //   ShowKeyboard 0x3a6770 moves KeyboardConfig field by field into the applet arguments: +0x24 title u16[65], +0xa6 subtitle u16[129], +0x1a8 hint u16[257],
 //     +0x3ac maximum length, +0x3b0 minimum length, +0x3bd isUseUtf8, +0x3c0 offset of the initial text within the work buffer, +0x3c4 UTF-16 length of the initial text;
 //     work buffer pointer / size at +0x4d0 / +0x4d8 (handed to the applet together with CreateLargeStorage)
+//   SetTextCheckCallback (SDK 18 disassembly): +0x3d0 callback-present flag (byte), the String* overload's callback at +0x3d8, the 3-String overload's at +0x4c8 (its second pointer at +0x4d0)
+//   The callback protocol (Grand Bazaar's validator, main+0x2862d30/+0x2862fb0): the SDK calls the game's callback with (out buffer, &out length, input String, ...); the game validates the input,
+//     writes the checked text to the out buffer with its length, and returns a TextCheckResult. The host must call it too: the game's validation state is only set when the callback runs,
+//     so a game that registers one rejects every name when the host skips it (Story of Seasons: Grand Bazaar, 2026-11-16). The host writes back the typed text as-is and lets the game show its own error;
+//     the callback's return value is for the applet, which the host has no equivalent of, so it is logged, not acted on
 //   SetInitialTextUtf8 0x3a74c0: UTF-8 → UTF-16 written to work buffer+offset (offset 0x14, at most 500 characters + terminating 0)
 //   ReadCloseResultAndString 0x3a63f0: output storage = u32 CloseResult + text area; the text area is copied as is into String{+0 pointer, +8 byte count}
 //   ShowKeyboard wrap-up 0x3a6acc: CloseResult == 0 (OK) → Result 0, otherwise (cancel) → 0x29F; GetRequiredStringBufferSize = 0x7D4
@@ -15,7 +20,7 @@
 #include "front.h"
 
 enum { ARG_HEADER = 0x24, ARG_SUB = 0xa6, ARG_GUIDE = 0x1a8, ARG_MAXLEN = 0x3ac, ARG_MINLEN = 0x3b0, ARG_UTF8 = 0x3bd,
-       ARG_INIT_OFF = 0x3c0, ARG_INIT_LEN = 0x3c4, ARG_WORKBUF = 0x4d0,
+       ARG_INIT_OFF = 0x3c0, ARG_INIT_LEN = 0x3c4, ARG_WORKBUF = 0x4d0, ARG_TC_FLAG = 0x3d0, ARG_TC_CB1 = 0x3d8, ARG_TC_CB2 = 0x4c8,
        HEADER_N = 65, SUB_N = 129, GUIDE_N = 257 };
 #define SWKBD_RESULT_CANCELED 0x29Fu   // swkbd module 159 / description 1: the constant the SDK returns when CloseResult != 0
 
@@ -60,6 +65,11 @@ _Thread_local int g_swkbd_min_chars = -1; // request-local UTF-16 minimum for th
 int g_swkbd_numeric_max = -1;   // ≥0 = this input is a quantity box, value = upper limit (set by dm_textinput.c, read by the front end input box, set back to -1 after use)
 int (*g_swkbd_unfilter)(void);   // registered by the host (dm_charname_unfilter in hle_charname.c; NULL in unit tests): keyboard requests from the naming panel bypass the game's ASCII typing filter
 typedef int (*swkbd_input_fn)(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap);
+// The game's text-check callback (SetTextCheckCallback): (out buffer, &out length, input String[, String, String]) -> TextCheckResult.
+// The SDK calls it while the keyboard is up; the host calls it once the text is in, before handing the result back, so the game's validation runs exactly once per entry
+typedef int (*swkbd_tc_cb1)(void *, size_t *, const void *);
+typedef int (*swkbd_tc_cb2)(void *, size_t *, const void *, const void *, const void *);
+typedef struct { const void *ptr; uint64_t size; } swkbd_string;
 Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     const uint8_t *arg = arg_;
     char title[HEADER_N * 3 + 1], sub[SUB_N * 3 + 1], guide[GUIDE_N * 3 + 1], init[501 * 3 + 1] = "", text[1002 * 3 + 1];
@@ -83,8 +93,10 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     int r = script ? (snprintf(text, sizeof text, "%s", script), 1) : input(title, sub, guide, init, maxlen > 0 ? maxlen : 0, text, sizeof text);
     g_swkbd_min_chars = -1;
     g_swkbd_numeric_max = -1;   // the numeric box mark applies to this one time only (set by dm_textinput.c before bringing up the keyboard)
-    LOG("swkbd: title '%s' initial '%s' limit %d → %s%s%s", title, init, maxlen,
+    LOG("swkbd: title '%s' initial '%s' limit %d min %d utf8 %d → %s%s%s", title, init, maxlen, minlen, (int)arg[ARG_UTF8],
         r > 0 ? "OK '" : r == 0 ? "cancel" : "no window, treated as cancel", r > 0 ? text : "", r > 0 ? "'" : "");
+    { void *cb1, *cb2; memcpy(&cb1, arg + ARG_TC_CB1, 8); memcpy(&cb2, arg + ARG_TC_CB2, 8);
+      LOG("swkbd: text check flag %d cb1 %p cb2 %p work %p", (int)arg[ARG_TC_FLAG], cb1, cb2, (void *)work); }
     if (r <= 0) return SWKBD_RESULT_CANCELED;
     if (g_swkbd_name_panel && g_swkbd_unfilter && g_swkbd_unfilter()) LOG("swkbd: naming panel -- turned off the game's ASCII input filter on the returned string (Chinese names allowed, see hle_charname.c)");
 
@@ -94,12 +106,23 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     uint16_t u16[1003]; size_t n = swkbd_u8_to_u16(text, maxlen > 0 ? (size_t)maxlen : 1002, u16, 1003);   // truncate to the character limit (counted in UTF-16 units)
     if (arg[ARG_UTF8]) swkbd_u16_to_u8(u16, n, (char *)buf, cap);
     else memcpy(buf, u16, (n + 1) * 2 <= cap ? n * 2 : (cap / 2 - 1) * 2);
+    LOG("swkbd: wrote back %zu chars as %s (buffer %p, cap %llu)", n, arg[ARG_UTF8] ? "UTF-8" : "UTF-16", (void *)buf, (unsigned long long)cap);
+    { void *cb1, *cb2; memcpy(&cb1, arg + ARG_TC_CB1, 8); memcpy(&cb2, arg + ARG_TC_CB2, 8);
+      if (arg[ARG_TC_FLAG] && (cb1 || cb2)) {   // the game registered a text check: run it, as the SDK does, so the game's validation sees the entered text
+        swkbd_string str = { u16, (uint64_t)(n + 1) * 2 };   // the input String, UTF-16 with its terminator (the game's validator copies `size` bytes and scans for the NUL)
+        uint8_t tc_out[0x7D4]; size_t tc_len = 0;   // the checked text goes here (GetRequiredStringBufferSize); the host keeps the typed text, the callback's output is the applet's to show
+        int tc = cb2 ? ((swkbd_tc_cb2)cb2)(tc_out, &tc_len, &str, &str, &str) : ((swkbd_tc_cb1)cb1)(tc_out, &tc_len, &str);
+        LOG("swkbd: text check %s returned %d, out length %zu", cb2 ? "cb2" : "cb1", tc, tc_len);
+        { char hex[65]; size_t m = tc_len < 32 ? tc_len : 32; for (size_t i = 0; i < m; i++) snprintf(hex + i * 2, 3, "%02x", tc_out[i]); hex[m * 2] = 0;
+          LOG("swkbd: text check out bytes: %s", hex); }   // TEMP DIAG: what the game's callback actually writes (Grand Bazaar name bug)
+      } }
     { const char *lag = getenv("DM_TEST_SWKBD_LAG_MS"); if (lag) usleep((useconds_t)atoi(lag) * 1000); }   // test: slow down "keyboard handed back → the game's thread gets the result" to verify that auto-accept does not jump the gun   // front end path cleanup (dm_cursor.c): auto-accept after the name is typed on the naming page
     return RES_OK;
 }
 
 HLE_FORCE("_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE", "software keyboard applet → host native input box (DM_KBD gives the text directly)",
           Result, h_swkbd_Show, void *out, const void *arg) {
+    LOG("swkbd: ShowKeyboard called from %p", __builtin_return_address(0));   // TEMP DIAG: which main call site (wrapper 0x10b8a8 vs Unity 0x14ad538) — Grand Bazaar name bug
     return swkbd_show(out, arg, front_text_input);
 }
 

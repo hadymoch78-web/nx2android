@@ -681,11 +681,23 @@ def table_cands(insl, rb):
         m = re.fullmatch(rf'{rb}, {rb}, #(0x[0-9a-f]+|\d+)', q.op_str) if q is not None and q.mnemonic == 'add' else None
         if m: cands.add(p.operands[1].imm + int(m.group(1), 0))
     return sorted(cands)
+def tail_call_padded(insl, j):
+    """An unframed, straight-line pointer thunk ending in br x18 and zero trap padding. (Backported from upstream nxnative for Anthos' Unity IL2CPP interface dispatch thunks: ldp x18, x17, [x17, #0x138]; br x18.)"""
+    if j + 1 >= len(insl) or any(p.mnemonic != 'udf' or p.op_str != '#0' for p in insl[j + 1:]): return False
+    if any(b.address != a.address + 4 for a, b in zip(insl, insl[1:])): return False
+    for p in insl[:j]:
+        if p.mnemonic not in ('mov', 'ldr', 'ldrh', 'ldp', 'add', 'str', 'stp'): return False
+        if {p.reg_name(r) for r in p.regs_access()[1]} & {'sp', 'wsp', 'fp', 'lr', 'x29', 'w29', 'x30', 'w30'}: return False
+    for p in reversed(insl[:j]):
+        if not {'x18', 'w18'} & {p.reg_name(r) for r in p.regs_access()[1]}: continue
+        return p.mnemonic in ('ldr', 'ldp') and bool(re.fullmatch(r'x18, (x\d+, )?\[(x\d+|sp)(, #(0x[0-9a-f]+|\d+))?\]', p.op_str))
+    return False
 def tail_call(insl, j):
     """The br x18 is an indirect tail call, not a jump table: the last write of x18 before it is a plain pointer load and the br ends the function. Ace Attorney Investigations Collection
     (Unity 2022.3 IL2CPP) main+0x1d271bc: ldr x18,[x0,#0x18]; ...; ldr x16,[sp]; ...; br x18, a thunk that moves stack arguments and jumps to the method pointer at +0x18.
     The br need not end the function when the frame is popped between the load and the br: Blasphemous 2 (Unity 2021.3 IL2CPP) main+0x1e86fc, ldr x18,[x0,#0x10]; ...;
     ldp x29,x30,[sp],#0x10; br x18, with the null check's throw (bl; udf) after it"""
+    if tail_call_padded(insl, j): return True
     popped = j + 1 == len(insl)
     for p in reversed(insl[:j]):
         if p.mnemonic == 'ldp' and re.fullmatch(r'x29, x30, \[sp\], #(0x[0-9a-f]+|\d+)', p.op_str): popped = True

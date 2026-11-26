@@ -54,6 +54,27 @@ static uint64_t proc_start_mono_ns(void) {
     return age > 0 ? mono - (uint64_t)age : mono;
 }
 
+// Split a game-arguments string at spaces, keeping double-quoted parts together: -ExecCmds="r.ScreenPercentage 50" is one argument, quotes stripped.
+// Unquoted input splits exactly as strtok(s, " ") did (runs of spaces collapse, no empty arguments); an unterminated quote takes the rest of the string.
+// The tokens point into s, compacted in place. Returns the number of tokens stored (at most max).
+static int split_args(char *s, char **out, int max) {
+    int n = 0;
+    char *p = s;
+    while (*p && n < max) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        char *t = p, *w = p; int q = 0;
+        while (*p) {
+            if (*p == '"') { q = !q; p++; continue; }
+            if (*p == ' ' && !q) break;
+            *w++ = *p++;
+        }
+        if (*p == ' ') p++;   // consume the separator first: w can equal p, and terminating the token would overwrite it with NUL
+        if (w > t) { *w = 0; out[n++] = t; }   // a token of only quotes ("") adds nothing, as strtok skipped empty tokens
+    }
+    return n;
+}
+
 // Host loading (independent of UIKit / Metal): read the NSO, relocate, forced take-over, probes / tick gate / keys, start prefetch. By default it runs synchronously in main;
 // the iOS front end can call dm_host_preload_start(same arguments) at the very start of the App's main() so that it runs first on a background thread, in parallel with the UIKit startup chain (⓪ + ① ≈ max(UIKit chain, host loading)).
 static pthread_key_t g_race_keys[512];
@@ -87,13 +108,13 @@ static void host_preload(int argc, char **argv) {
     int i = 2;
     for (; i < argc && strcmp(argv[i], "--") && n < MAX_MOD; i++) names[n++] = argv[i];
     if (i < argc && !strcmp(argv[i], "--")) for (i++; i < argc && g_argc < 63; i++) g_argv[g_argc++] = argv[i];
-    else if (*DM_GAME_ARGS) {   // no "--" on the command line (the iOS app, the NSP script's Mac runs): the game profile's game_args, split at spaces
+    else if (*DM_GAME_ARGS) {   // no "--" on the command line (the iOS app, the NSP script's Mac runs): the game profile's game_args, split at spaces (double quotes group)
         char *s = strdup(DM_GAME_ARGS);
-        for (char *t = strtok(s, " "); t && g_argc < 63; t = strtok(NULL, " ")) g_argv[g_argc++] = t;
+        g_argc += split_args(s, g_argv + g_argc, 63 - g_argc);
         LOG("game arguments from the game profile: %s", DM_GAME_ARGS);
     }
-    { const char *e = getenv("DM_GAME_ARGS_ADD");   // (env.txt on Android) more arguments after the profile's, split at spaces: an engine's settings tried without a new port
-      if (e && *e) { char *s = strdup(e); for (char *t = strtok(s, " "); t && g_argc < 63; t = strtok(NULL, " ")) g_argv[g_argc++] = t; LOG("game arguments added by DM_GAME_ARGS_ADD: %s", e); } }
+    { const char *e = getenv("DM_GAME_ARGS_ADD");   // (env.txt on Android) more arguments after the profile's, split at spaces (double quotes group): an engine's settings tried without a new port
+      if (e && *e) { char *s = strdup(e); g_argc += split_args(s, g_argv + g_argc, 63 - g_argc); LOG("game arguments added by DM_GAME_ARGS_ADD: %s", e); } }
     if (!n) { static const char *def[] = DM_GAME_MODULES; for (int k = 0; k < DM_GAME_NMOD && n < MAX_MOD; k++) names[n++] = def[k]; }   // default module list from the game profile's modules (Mario: main sdk)
     load_modules(argv[1], names, n);
     dm_sdk_major();   // logs the SDK version, which SDK-dependent behaviour follows (loader.c)

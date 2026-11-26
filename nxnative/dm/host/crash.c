@@ -162,6 +162,7 @@ void dm_guest_write_prepare(void *addr, size_t len) { for (int i = 0; i < g_nwri
 // The diagnostics module (the probes in diag.c) and the thread state dump (hle_thread.c) each register themselves here: a unit test that links only this file does not depend on them
 static int (*g_trap_hook)(ucontext_t *uc);
 void crash_set_trap_hook(int (*fn)(ucontext_t *uc)) { g_trap_hook = fn; }
+int (*crash_trap_hook(void))(ucontext_t *uc) { return g_trap_hook; }   // the current trap hook, for chaining (dm_hook.c)
 void crash_set_dump_hook(void (*fn)(void)) { g_dump_hook = fn; }
 void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // Notes printed right after the crashing thread's registers: what host threads were doing when it crashed (the Vulkan backend: the pipelines being built, gfx_vk_exec.c)

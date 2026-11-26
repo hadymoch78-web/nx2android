@@ -14,11 +14,13 @@ _p.add_argument('--icon-bg', help='the adaptive icon\'s background layer (a PNG,
 _p.add_argument('--asset', action='append', default=[], metavar='NAME=FILE', help='a file the app reads with AAssetManager as NAME (assets/NAME in the APK): the gamepad theme')
 _p.add_argument('--dex', help='optional classes.dex for a custom NativeActivity')
 _p.add_argument('--activity', default='android.app.NativeActivity', help='NativeActivity class name')
+_p.add_argument('--picker', action='store_true', help='a driver choice on launch: org.nx2a.DriverPickerActivity becomes the launcher activity and the NativeActivity starts from it, with a graphics settings screen and a bug report screen the picker opens (needs --dex)')
 _p.add_argument('--release', action='store_true', help='not debuggable')
 _p.add_argument('--version-code', type=int, default=1, help='versionCode: a later port of the game must have a higher one to install over it')
 _p.add_argument('--version-name', default='1.0', help='versionName: the version the player sees (the game\'s display version)'); ARGS = _p.parse_args()
 PKG, LIB, LABEL = ARGS.package, ARGS.lib, ARGS.label
 if ARGS.activity != 'android.app.NativeActivity' and not ARGS.dex: _p.error('--activity requires --dex')
+if ARGS.picker and not ARGS.dex: _p.error('--picker requires --dex')
 if bool(ARGS.icon_fg) != bool(ARGS.icon_bg) or (ARGS.icon_fg and not ARGS.icon): _p.error('--icon-fg and --icon-bg go together, with --icon')
 MIN_SDK, TARGET_SDK = 29, 36
 ANDROID_NS = 'http://schemas.android.com/apk/res/android'
@@ -34,11 +36,31 @@ ATTR_IDS = {  # android: attribute resource IDs (frameworks/base/core/res/res/va
     'label': 0x01010001, 'icon': 0x01010002, 'name': 0x01010003, 'hasCode': 0x0101000c, 'debuggable': 0x0101000f, 'exported': 0x01010010,
     'configChanges': 0x0101001f, 'screenOrientation': 0x0101001e, 'value': 0x01010024, 'minSdkVersion': 0x0101020c, 'versionCode': 0x0101021b,
     'versionName': 0x0101021c, 'targetSdkVersion': 0x01010270, 'maxSdkVersion': 0x01010271, 'isGame': 0x010103f4, 'extractNativeLibs': 0x010104ea, 'appCategory': 0x01010545,
-    'requestLegacyExternalStorage': 0x01010603, 'enableOnBackInvokedCallback': 0x0101066c, 'drawable': 0x01010199}   # (maxSdkVersion and requestLegacyExternalStorage read from android-36's android.jar, R$attr)
+    'requestLegacyExternalStorage': 0x01010603, 'enableOnBackInvokedCallback': 0x0101066c, 'drawable': 0x01010199,
+    'authorities': 0x01010018, 'grantUriPermissions': 0x0101001b}   # (authorities and grantUriPermissions read from android-35's android.jar, R$attr)
 T_REF, T_STRING, T_INT_DEC, T_INT_HEX, T_BOOL = 0x01, 0x03, 0x10, 0x11, 0x12
 ICON_ID, ICON_FG_ID, ICON_BG_ID = 0x7f010000, 0x7f010001, 0x7f010002   # drawable/icon, icon_fg, icon_bg in resources.arsc (res_table)
 # A plain icon is drawn small on a white disc by Android 8+ launchers; an adaptive one fills the launcher's icon shape
 ADAPTIVE_ICON = ('adaptive-icon', [], [('background', [(True, 'drawable', ('ref', ICON_BG_ID))], []), ('foreground', [(True, 'drawable', ('ref', ICON_FG_ID))], [])])
+
+# The game's activity: the launcher by itself, or started by the driver picker (--picker), which then owns the LAUNCHER filter. The picker and the bug
+# report screen are plain Activities (no lib_name: they load no native code); the game activity keeps its lib_name and stays exported so the picker can
+# start it. The bug report screen is started only from inside the app, so it is not exported and has no launcher filter.
+# The bug report's attachments go out through a provider of the app's own (BugReportProvider): a FileProvider would need AndroidX, which the dex does not
+# carry, and an XML resource, which this builder does not pack. The provider is not exported; the share intent grants one-time read access to its URIs.
+GAME_ACTIVITY = ('activity', [(True, 'name', ARGS.activity), (True, 'exported', True), (True, 'configChanges', ('hex', CONFIG_CHANGES))] + ([(True, 'screenOrientation', 6)] if ARGS.landscape else []), [
+    ('meta-data', [(True, 'name', 'android.app.lib_name'), (True, 'value', LIB)], [])]
+    + ([] if ARGS.picker else [('intent-filter', [], [
+        ('action', [(True, 'name', 'android.intent.action.MAIN')], []),
+        ('category', [(True, 'name', 'android.intent.category.LAUNCHER')], [])])]))
+PICKER_ACTIVITY = ('activity', [(True, 'name', 'org.nx2a.DriverPickerActivity'), (True, 'exported', True), (True, 'configChanges', ('hex', CONFIG_CHANGES))], [
+    ('intent-filter', [], [
+        ('action', [(True, 'name', 'android.intent.action.MAIN')], []),
+        ('category', [(True, 'name', 'android.intent.category.LAUNCHER')], [])])])
+BUGREPORT_ACTIVITY = ('activity', [(True, 'name', 'org.nx2a.BugReportActivity'), (True, 'exported', False), (True, 'configChanges', ('hex', CONFIG_CHANGES))], [])
+BUGREPORT_PROVIDER = ('provider', [(True, 'name', 'org.nx2a.BugReportProvider'), (True, 'authorities', PKG + '.bugreport'), (True, 'exported', False), (True, 'grantUriPermissions', True)], [])
+ACTIVITIES = [PICKER_ACTIVITY, BUGREPORT_ACTIVITY, GAME_ACTIVITY] if ARGS.picker else [GAME_ACTIVITY]
+APP_CHILDREN = ACTIVITIES + ([BUGREPORT_PROVIDER] if ARGS.picker else [])
 
 # (tag, [(ns_android?, name, value)], children)
 MANIFEST = ('manifest', [(False, 'package', PKG), (True, 'versionCode', ARGS.version_code), (True, 'versionName', ARGS.version_name)], [
@@ -61,12 +83,7 @@ MANIFEST = ('manifest', [(False, 'package', PKG), (True, 'versionCode', ARGS.ver
         (True, 'appCategory', 0),   # a game (appCategory game = 0, and the older isGame): Android's game mode and game dashboard, and the device maker's game tools, apply to it
         # no predictive back: from target SDK 36 the system takes the back gesture itself and finishes the activity, which ends the game (front_android.c on_destroy), without
         # dispatching KEYCODE_BACK; opted out, the gesture comes as the Back key, which opens the front end's menu
-        (True, 'enableOnBackInvokedCallback', False)], [
-        ('activity', [(True, 'name', ARGS.activity), (True, 'exported', True), (True, 'configChanges', ('hex', CONFIG_CHANGES))] + ([(True, 'screenOrientation', 6)] if ARGS.landscape else []), [
-            ('meta-data', [(True, 'name', 'android.app.lib_name'), (True, 'value', LIB)], []),
-            ('intent-filter', [], [
-                ('action', [(True, 'name', 'android.intent.action.MAIN')], []),
-                ('category', [(True, 'name', 'android.intent.category.LAUNCHER')], [])])])])])
+        (True, 'enableOnBackInvokedCallback', False)], APP_CHILDREN)])
 
 def axml(root):
     # string pool: attribute names that carry resource IDs come first, in resource-map order

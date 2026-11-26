@@ -55,7 +55,7 @@ static size_t pcache_load(void) {
     pcache_path();pcache_header identity=pcache_identity(),header;size_t bytes=0;void *data=NULL;
     int legacy=0;uint8_t digest[32];
     g_pcache_digest_valid=0;g_pcache_migrate=0;
-    FILE *file=g_pcache_path[0] && !getenv("DM_VK_NOPCACHE") ? fopen(g_pcache_path,"rb") : NULL;
+    FILE *file=g_pcache_path[0] && !getenv("DM_VK_NOPCACHE") && !getenv("DM_VK_FLATCOLOR") ? fopen(g_pcache_path,"rb") : NULL;
     if (file) {
         struct stat st;uint8_t prefix[32];size_t payload=0;
         int valid=!fstat(fileno(file),&st) && S_ISREG(st.st_mode) &&
@@ -103,6 +103,7 @@ static size_t pcache_load(void) {
 }
 void vk_pipeline_cache_changed(void) { atomic_fetch_add_explicit(&g_pcache_generation,1,memory_order_relaxed); }
 void vk_pipeline_cache_save(void) {
+    if (getenv("DM_VK_FLATCOLOR")) return;   // never persist flatcolor pipelines
     if (!V.pcache || !g_pcache_path[0]) return;
     pthread_mutex_lock(&g_pcache_io);
     uint64_t generation=atomic_load_explicit(&g_pcache_generation,memory_order_relaxed);

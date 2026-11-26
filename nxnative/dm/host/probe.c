@@ -389,5 +389,6 @@ void probe_install(void) {
     }
     if (g_slots && !g_slots_sealed) { mprotect(g_slots, 0x4000, PROT_READ | PROT_EXEC); sys_icache_invalidate(g_slots, 0x4000); g_slots_sealed = 1; }
     watch_install();
+    { void dm_hook_install(void); dm_hook_install(); }   // BRK hooks on guest code (DM_HOOK_1CED80C, dm_hook.c)
 #endif
 }

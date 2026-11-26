@@ -8,6 +8,8 @@ static struct { uint32_t magic; void *layer; } g_native = {0x4e49574e, 0};
 
 HLE_FORCE("_ZN2nn2vi10InitializeEv", "display service init; the host has no vi service", void, h_vi_Init, void) {}
 HLE_FORCE("_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", "open default display; the host returns a static object", Result, h_vi_OpenDisp, void **out) {
+    { static int seen; if (dm_vi_arg_on() && !seen) { seen = 1; LOG("vi-arg: OpenDefaultDisplay"); } }
+    dm_evt8_log("vi::OpenDefaultDisplay");
     *out = &g_display; return RES_OK;
 }
 // The named overload (South Park: The Stick of Truth, SDK 4.5.0, opens the display as "Default" early in nnMain). The host has no vi service, and this one's own
@@ -15,9 +17,13 @@ HLE_FORCE("_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", "open default display
 // (SIGSEGV at sdk+0x1d2f30, nn::vi::OpenDisplay+0xf4). Same two-enumeration shape as CreateLayer's size overload below: the host returns its static display.
 HLE_FORCE("_ZN2nn2vi11OpenDisplayEPPNS0_7DisplayEPKc", "open the named display (\"Default\"); the host returns the same static object as OpenDefaultDisplay", Result, h_vi_OpenDispNamed, void **out, const char *name) {
     LOG("vi::OpenDisplay(\"%s\")", name ? name : "");
+    { static int seen; static char last[64]; if (dm_vi_arg_on() && (!seen || strcmp(last, name ? name : ""))) { seen = 1; snprintf(last, sizeof last, "%s", name ? name : ""); LOG("vi-arg: OpenDisplay(\"%s\")", name ? name : ""); } }
+    dm_evt8_log("vi::OpenDisplay(\"%s\")", name ? name : "");
     *out = &g_display; return RES_OK;
 }
 HLE_FORCE("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", "create layer; the host returns a static object", Result, h_vi_CreateLayer, void **out, void *disp) {
+    { static int seen; if (dm_vi_arg_on() && !seen) { seen = 1; LOG("vi-arg: CreateLayer"); } }
+    dm_evt8_log("vi::CreateLayer");
     (void)disp; *out = &g_layer; return RES_OK;
 }
 // The overload with the layer's size (SDL3's Switch video driver, Absolum: 1920x1080 docked); the SDK's version calls through the vi service object the host never made (SIGSEGV at +0xe4).
@@ -27,10 +33,14 @@ static _Atomic uint32_t g_layer_wh;   // w | h << 16 of the last sized CreateLay
 void dm_vi_layer_size(int *w, int *h) { uint32_t v = g_layer_wh; *w = (int)(v & 0xffff); *h = (int)(v >> 16); }
 HLE_FORCE("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayEii", "create layer of a given size; the host returns a static object", Result, h_vi_CreateLayerWH, void **out, void *disp, int w, int h) {
     (void)disp; LOG("vi::CreateLayer %dx%d", w, h); *out = &g_layer;
+    { static int seen, lw, lh; if (dm_vi_arg_on() && (!seen || lw != w || lh != h)) { seen = 1; lw = w; lh = h; LOG("vi-arg: CreateLayer(%dx%d)", w, h); } }
+    dm_evt8_log("vi::CreateLayer(%dx%d)", w, h);
     if (w > 0 && h > 0 && w < 0x10000 && h < 0x10000) g_layer_wh = (uint32_t)w | (uint32_t)h << 16;
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", "native window handle, passed to the NVN window builder; the host returns a static object", Result, h_vi_GetNative, void **out, void *layer) {
+    { static int seen; if (dm_vi_arg_on() && !seen) { seen = 1; LOG("vi-arg: GetNativeWindow"); } }
+    dm_evt8_log("vi::GetNativeWindow");
     (void)layer; *out = &g_native; return RES_OK;
 }
 // Link's Awakening also crops its layer and tears the display down on exit; the SDK's versions dereference the vi service objects the host never made (SetLayerCrop: SIGSEGV at +0x64).
@@ -41,12 +51,16 @@ void dm_vi_layer_crop(int c[4]) { uint64_t v = g_crop; c[0] = (int)(v & 0xffff);
 HLE_FORCE("_ZN2nn2vi12SetLayerCropEPNS0_5LayerEiiii", "layer crop; the host records it and the Vulkan present crops by it", Result, h_vi_SetCrop, void *layer, int x, int y, int w, int h) {
     (void)layer;
     uint64_t v = x < 0 || y < 0 || w <= 0 || h <= 0 || x > 0xffff || y > 0xffff || w > 0xffff || h > 0xffff ? 0 : (uint64_t)x | (uint64_t)y << 16 | (uint64_t)w << 32 | (uint64_t)h << 48;
-    if (atomic_exchange(&g_crop, v) != v) LOG("vi::SetLayerCrop %d,%d %dx%d", x, y, w, h);
+    if (atomic_exchange(&g_crop, v) != v) { LOG("vi::SetLayerCrop %d,%d %dx%d", x, y, w, h);
+        if (dm_vi_arg_on()) LOG("vi-arg: SetLayerCrop(%d,%d %dx%d)", x, y, w, h);
+        dm_evt8_log("vi::SetLayerCrop(%d,%d %dx%d)", x, y, w, h); }
     return RES_OK;
 }
 // Super Mario Odyssey sets its layer's scaling mode; the SDK's version uses the vi service objects the host never made
 HLE_FORCE("_ZN2nn2vi19SetLayerScalingModeEPNS0_5LayerENS0_11ScalingModeE", "layer scaling mode; the host present does its own scaling", Result, h_vi_SetScaling, void *layer, int mode) {
-    (void)layer; LOG("vi::SetLayerScalingMode %d (ignored)", mode); return RES_OK;
+    (void)layer; LOG("vi::SetLayerScalingMode %d (ignored)", mode);
+    { static int seen, lm; if (!seen || lm != mode) { seen = 1; lm = mode; if (dm_vi_arg_on()) LOG("vi-arg: SetLayerScalingMode(%d)", mode); dm_evt8_log("vi::SetLayerScalingMode(%d)", mode); } }
+    return RES_OK;
 }
 // Unreal Engine paces its frames by the layer's frame number (Octopath Traveler 0, main+0x10140e8); the SDK's versions read the Android surface of the vi service the host never made
 // (SIGSEGV in android::Surface::getQueuedFrameNumber). The host's frame number is the count of frames the game has presented
@@ -66,6 +80,7 @@ HLE_FORCE("_ZN2nn2vi32GetDefaultDisplayPanelIdentifierEPNS0_15PanelIdentifierE",
 // The Great Ace Attorney Chronicles (SDK 10) lists up to 10 displays before opening the default one (main+0x808f08) and does not read the list. DisplayInfo is 0x60 bytes:
 //   name[0x40], bool has a layer limit at +0x40, then u64 layer count limit, largest layer width and height. One display, "Default", as Horizon lists for an application
 HLE_FORCE("_ZN2nn2vi12ListDisplaysEPNS0_11DisplayInfoEi", "list displays; the host has one, \"Default\"", int, h_vi_ListDisp, void *out, int n) {
+    dm_evt8_log("vi::ListDisplays(%d)", n);
     if (n <= 0 || !out) return 0;
     uint8_t *p = out; memset(p, 0, 0x60); strcpy((char *)p, "Default");
     p[0x40] = 1; uint64_t lim[3] = {1, 1920, 1080}; memcpy(p + 0x48, lim, sizeof lim);

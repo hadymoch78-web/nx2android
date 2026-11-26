@@ -39,7 +39,25 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-void front_run(void (*guest)(void)) { guest(); }
+void front_run(void (*guest)(void)) {
+    // DM_LOG_MAPS=1: the process's .so mappings at boot, once, before the game starts — one line per mapping (path, base, size). A value found later
+    // in a .so's .bss is attributed by its delta to one of these bases; the guest modules' own mappings are anonymous and do not appear here.
+    { const char *e = getenv("DM_LOG_MAPS");
+      if (e && atoi(e)) { FILE *f = fopen("/proc/self/maps", "r");
+        if (f) { char line[1024];
+            while (fgets(line, sizeof line, f)) {
+                unsigned long long lo, hi; char perms[8], dev[16], path[768]; unsigned long off, ino;
+                if (sscanf(line, "%llx-%llx %7s %lx %15s %lu %767[^\n]", &lo, &hi, perms, &off, dev, &ino, path) >= 7 && strstr(path, ".so")) {
+                    char *p = path; while (*p == ' ') p++;
+                    LOG("maps: %s base %#llx size %#llx", p, lo, hi - lo);
+                }
+            }
+            fclose(f);
+        }
+      }
+    }
+    guest();
+}
 void *front_metal_layer(void) { return NULL; }
 int front_screen_max_fps(void) { return 0; }
 void front_screen_match(int fps) { (void)fps; }
@@ -238,7 +256,20 @@ static uint64_t key_bit(int32_t k) {   // Nintendo layout by position: the botto
     default: return 0;
     }
 }
-static int32_t axis(float v) { if (v > -0.12f && v < 0.12f) return 0; return (int32_t)(v * DM_STICK_MAX); }
+// The sticks' dead zone and response curve (DM_STICK_DEADZONE, DM_STICK_CURVE, read once): a smaller dead zone than the 0.12 the sticks had, and a power below 1
+// makes small deflections count for more (a racing game's steering answers sooner), while full deflection still reaches the maximum. 1.0 for the curve is linear.
+static float g_stick_dz = -1, g_stick_curve = -1;
+static int32_t axis(float v) {
+    if (g_stick_dz < 0) {
+        const char *d = getenv("DM_STICK_DEADZONE"), *c = getenv("DM_STICK_CURVE");
+        g_stick_dz = d ? fminf(0.5f, fmaxf(0.f, strtof(d, NULL))) : 0.05f;
+        g_stick_curve = c ? fminf(2.f, fmaxf(0.1f, strtof(c, NULL))) : 0.7f;
+    }
+    float a = fabsf(v);
+    if (a < g_stick_dz) return 0;
+    float s = (a - g_stick_dz) / (1.f - g_stick_dz);   // rescale past the dead zone so the output starts at 0 and still reaches the maximum
+    return (int32_t)(copysignf(powf(s, g_stick_curve), v) * DM_STICK_MAX);
+}
 static uint64_t g_shake_btn;   // DM_BTN_SHAKE while the device is being shaken (below); input thread only
 static uint64_t pad_axis_buttons(const float axes[8]) {
     uint64_t b = 0;

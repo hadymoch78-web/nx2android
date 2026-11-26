@@ -1,4 +1,4 @@
-# The port: a game folder (NSP / XCI, or NSZ / XCZ: porter.dumps) + prod.keys + the game's profile → <App>.apk and <App>-data/ (docs/ARCHITECTURE.md "The port").
+﻿# The port: a game folder (NSP / XCI, or NSZ / XCZ: porter.dumps) + prod.keys + the game's profile → <App>.apk and <App>-data/ (docs/ARCHITECTURE.md "The port").
 # The steps every platform shares are upstream's (porter.upstream.nsp: scan, extraction, the shader split, stage reuse, progress); the Android ones are here:
 # the rewrite for DM_TARGET=android, the Vulkan shader bundle, the host built with the player's NDK, the APK, the data pack and the install.
 # Work files go where upstream's NSP script puts them, <game folder>/<title ID>_build/ (extract/, aoc/, shader/, logs/ are shared with an iOS build of the same folder),
@@ -41,7 +41,8 @@ class Options:
     experimental: bool = False         # a game not ported to Android yet: a provisional profile from upstream's survey (or a copy of its iOS profile), status experimental
     package: str = ''                  # the app's package instead of the profile's (a test install beside another build of the game)
     fps60: bool = False                # 60 fps: the profile's own frame-rate cap, else the build's FPSLocker-Warehouse config (porter/fpslocker.py)
-    vulkan_driver: Path = None         # an arm64 Vulkan driver (Mesa's Turnip) packed in the APK and used instead of the system's (DM_VK_DRIVER, dm/android/gfx_vk_core.c)
+    vulkan_driver: list = None         # arm64 Vulkan drivers (Mesa's Turnip) packed in the APK and used instead of the system's (DM_VK_DRIVER, dm/android/gfx_vk_core.c); the first is the default, the rest are for the driver picker
+    driver_picker: bool = False        # a driver choice on launch: the app opens a picker (the packed drivers, or the system's) instead of starting the game at once
     shared_font: Path = None           # a TrueType font packed as the system's shared fonts, instead of the device's Roboto (DM_SHARED_FONT, dm/host/hle_sdk16.c)
     firmware: Path = None              # the player's system content files (.nca), for the profile's sysdata titles (extract_sysdata; DM_SYSDATA, dm/host/hle_fs.c)
     mt_replay: bool = False            # multithread replay: DM_VK_MT_REPLAY=1 in env.txt (dm/android/gfx_vk_dq.c), after the profile's env rows
@@ -65,6 +66,39 @@ def driver_lib_name(path):
     Turnip T30 is vulkan.purple.so, other Turnip builds vulkan.freedreno.so) never reached the app's library folder, and adrenotools fell back to the system's driver"""
     name = Path(path).name
     return name if name.startswith('lib') else f'lib{name}'
+
+
+def driver_family(label):
+    """The GPUs a driver label names, as comma-separated match tokens: exact Adreno models (710, 720, 722), Adreno families (6xx, 7xx, 8xx), exact Mali models
+    (G57, G77, ...) for a PanVK build, and exact Xclipse models (920, 940, 950) for a RADV build. The standard Turnip build lives in a folder like Turnip27-6xx-7xx,
+    the A8xx build in Turnip27-A8xx, the midrange build in Turnip27-710-720-722, a PanVK build in PanVK-G52-G57-G68-G71-G72-G76-G77-G78, a RADV build in RADV-Xclipse;
+    '' when the label says none. The picker prefers an exact-model match over a family match, so a 710 GPU gets the midrange build while a 735 gets the standard one.
+    Mali has no family token on purpose: a PanVK build serves the models it names, not every Mali GPU (the CSF models G610 and newer need their own build), so a Mali GPU
+    with no exact match falls back to the system's driver. Xclipse likewise has no family token: a RADV build serves the models it names (920/940/950, Exynos 2200/2400/2500),
+    and an Xclipse model it does not name (530, 540) falls back to the system's driver; a bare 'Exynos' is never a token, since Mali-based Exynos chips are PanVK's"""
+    low = label.lower()
+    tokens = [m for m in ('710', '720', '722') if m in low]
+    tokens += [f for f in ('6xx', '7xx', '8xx') if f in low or ('a' + f) in low or ('gen' + f[0]) in low]
+    if 'panvk' in low or 'mali' in low:
+        tokens += [m for m in ('G52', 'G57', 'G68', 'G71', 'G72', 'G76', 'G77', 'G78', 'G610', 'G615', 'G710', 'G720') if m.lower() in low]
+    if 'xclipse' in low:
+        tokens += [m for m in ('920', '940', '950') if m in low] or ['920', '940', '950']
+    return ','.join(tokens)
+
+
+def driver_entries(drivers):
+    """(source, lib name, label, family) per --vulkan-driver: the label is the library's folder (Turnip27, Turnip27-A8xx), and libraries that would share a lib
+    name (every Turnip zip's libvulkan_freedreno.so) get _2, _3, ... so each packed driver is a file of its own"""
+    out, used = [], set()
+    for d in drivers or []:
+        name = driver_lib_name(d)
+        if name in used:
+            stem, n = name[:-3], 2
+            while f'{stem}_{n}.so' in used: n += 1
+            name = f'{stem}_{n}.so'
+        used.add(name)
+        out.append((d, name, d.parent.name, driver_family(d.parent.name)))
+    return out
 
 
 def app_stem(g, name):   # the file name of the APK and the data pack: the profile's iOS IPA name without .ipa (NeoTheWorldEndsWithYou)
@@ -211,8 +245,10 @@ class Port:
         if not o.folder.is_dir(): raise BuildError(f'not a folder: {o.folder}')
         version_code('v0', o.vercode_offset); alias_headroom_gb(o.alias_headroom)   # an offset or headroom out of range fails now, not after the shaders
         if o.vulkan_driver:
-            o.vulkan_driver = Path(o.vulkan_driver).expanduser().resolve()
-            if not o.vulkan_driver.is_file() or o.vulkan_driver.suffix != '.so': raise BuildError(f'--vulkan-driver: not a .so library: {o.vulkan_driver}')
+            o.vulkan_driver = [Path(d).expanduser().resolve() for d in o.vulkan_driver]
+            for d in o.vulkan_driver:
+                if not d.is_file() or d.suffix != '.so': raise BuildError(f'--vulkan-driver: not a .so library: {d}')
+        if o.driver_picker and not o.vulkan_driver: raise BuildError('--driver-picker needs at least one --vulkan-driver to choose from')
         if o.shared_font:
             o.shared_font = Path(o.shared_font).expanduser().resolve()
             if not o.shared_font.is_file() or o.shared_font.suffix.lower() != '.ttf': raise BuildError(f'--shared-font: not a .ttf font: {o.shared_font}')
@@ -245,7 +281,7 @@ class Port:
         self.apk()
         self.data()
         if o.install: self.install()
-        nsp.rmtree(self.work / 'tmp')
+        # nsp.rmtree(self.work / 'tmp')
         self.result.update(title_id=self.g.id, name=self.app_name, package=self.package, version=self.pkg_ver, display=self.display, language=self.lang,
                            status=self.ap.status, derived=bool(self.derived), installed=bool(o.install))
         say(f'done: {self.result["apk"]} and {self.result["data"]}')
@@ -462,12 +498,17 @@ class Port:
         self.ue_why = src['ue_decode'][1] if src['ue_decode'][0] else ''
         why = self.oodle_why or self.ue_why
         if why:
-            if not self.tools.get('adb'):   # adb is optional for a port that does not install (toolchain.require): this one needs it
+            from porter.local_oodle import find_ooz   # local decode (ooz) instead of the device, when its exe is present
+            self.local_oodle = bool(find_ooz())
+            if self.local_oodle:
+                say(f"{self.app_name}'s shaders are in Oodle-compressed archives ({why}): decoding them on this PC with ooz (no device needed)")
+            elif not self.tools.get('adb'):   # adb is optional for a port that does not install (toolchain.require): this one needs it
                 raise BuildError(f"{self.app_name}'s shaders are in Oodle-compressed archives ({why}): the port decodes them with the game's own decoder on the Android "
                                  f'device, so it needs adb and the device even without installing. {NO_ADB}; then connect the device (USB debugging on) and port again')
-            try: Adb(self.tools['adb'], self.o.device or self.cfg.get('device'), log=say).pick()
-            except (AdbError, KeyError) as e: raise BuildError(f"{self.app_name}'s shaders are in Oodle-compressed archives ({why}): the port decodes them with the game's own decoder on "
-                                                               f'the Android device, so connect it (adb) and port again ({e})') from e
+            else:
+                try: Adb(self.tools['adb'], self.o.device or self.cfg.get('device'), log=say).pick()
+                except (AdbError, KeyError) as e: raise BuildError(f"{self.app_name}'s shaders are in Oodle-compressed archives ({why}): the port decodes them with the game's own decoder on "
+                                                                   f'the Android device, so connect it (adb) and port again ({e})') from e
         for k in ('glslc_capture', 'ue_legacy') + (() if self.ue_why else ('ue_decode',)) + (() if self.oodle_why else ('oodle_packs',)):
             if src[k][0]: raise BuildError(f'{self.app_name} needs a step that boots the game in the Mac host ({src[k][1]}), which the Android port cannot run yet')
 
@@ -542,6 +583,13 @@ class Port:
     def device_oodle_job(self, job, out, bnsh=False):
         """One Oodle job file (hle_oodle.c: "DMOJ" records) decoded on the device into out ("DMOR"); the job file is removed. The host as an executable and the rewritten modules
         go to the device once a port (device_oodle_end removes them). bnsh: only the entries that hold a BNSH shader come back (DM_OODLE_JOB_BNSH)"""
+        if getattr(self, 'local_oodle', False):   # local decode with ooz: same DMOJ in, same DMOR out, no device
+            from porter.local_oodle import decode_job
+            n, bad = decode_job(job, out, bnsh=bnsh, log=say)
+            nsp.rmtree(job)
+            if bad: raise BuildError(f'the local Oodle decoder (ooz) failed on {bad} of {n} streams in {Path(job).name}: the streams may use an Oodle variant ooz cannot decode; '
+                                     f'remove ooz.exe from the repo root and port again with a device connected')
+            return
         adb = getattr(self, 'oodle_adb', None)
         if not adb:
             adb = Adb(self.tools['adb'], self.o.device or self.cfg.get('device'), log=say); adb.pick()
@@ -715,7 +763,7 @@ class Port:
         report.replace(published_report)
         product_cache.stamp(kf, key, self.dmsv, note, complete=complete, companions=(published_report,))
         PROG.end(note)
-        for d in (self.work / 'tmp').glob('shvk_*'): nsp.rmtree(d)   # the translator's work folders
+# for d in (self.work / 'tmp').glob('shvk_*'): nsp.rmtree(d)   # the translator's work folders
 
     def pull_captures(self):
         """Shaders whose code no game file holds: the app saves each one the bundle lacks on the device (gfx_vk_shader.c vk_shader_missing), and they are
@@ -771,34 +819,56 @@ class Port:
         code = version_code(self.pkg_ver, self.o.vercode_offset)
         if self.o.vercode_offset: say(f'versionCode {code} ({self.pkg_ver} + 1 + offset {self.o.vercode_offset})')
         external = self.external_activity() if self.o.external_display or self.o.native_keyboard else []
-        driver = self.o.vulkan_driver
-        if driver and driver.name != driver_lib_name(driver):   # packed under a lib*.so name (driver_lib_name), copied beside the host library
-            driver = self.so.parent / driver_lib_name(driver); shutil.copyfile(self.o.vulkan_driver, driver)
-            say(f'--vulkan-driver: {self.o.vulkan_driver.name} is packed as {driver.name} (Android extracts only lib*.so libraries)')
+        drivers = driver_entries(self.o.vulkan_driver)
+        packed = []
+        for src, name, label, _fam in drivers:   # packed under a lib*.so name (driver_lib_name), copied beside the host library
+            dst = self.so.parent / name
+            if src.name != name or src.parent != self.so.parent: shutil.copyfile(src, dst)
+            packed.append(dst)
+            say(f'--vulkan-driver: {src.name} is packed as {name} ({label})' + ('' if src.name == name else ' (Android extracts only lib*.so libraries)'))
+        picker = self.driver_picker(external) if self.o.driver_picker else []
         nsp.run([PY, DM / 'android/apk/mkapk.py', self.so, self.apk_path, paths.signing_key(), '--package', self.package, '--label', self.app_name, '--lib', 'dmhost',
                  '--version-code', str(code), '--version-name', self.display]
-                + (['--landscape'] if self.ap.landscape else []) + icon + self.theme() + self.ui_font() + external + ([] if self.o.debug else ['--release'])
-                + [a for f in ([driver] + [self.so.parent / n for n in ADRENOTOOLS_LIBS] if driver else []) for a in ('--extra-so', str(f))],
+                + (['--landscape'] if self.ap.landscape else []) + icon + self.theme() + self.ui_font() + external + picker + ([] if self.o.debug else ['--release'])
+                + [a for f in (packed + [self.so.parent / n for n in ADRENOTOOLS_LIBS] if packed else []) for a in ('--extra-so', str(f))],
                 self.logs / 'android_apk.log', env=self.env)
         self.result['apk'] = str(self.apk_path)
         PROG.end(f'{self.apk_path.name}, {self.apk_path.stat().st_size / 2**20:.1f} MB')
 
-    def external_activity(self):
+    def java_dex(self):
+        """The Java sources (dm/android/java/org/nx2a) compiled to a classes.dex: the external activity and the driver picker share the one build"""
         javac = shutil.which('javac')
         roots = toolchain._sdk_roots()
         platforms = [p for root in roots for p in (root / 'platforms').glob('android-*/android.jar')]
         d8s = [p for root in roots for p in (root / 'build-tools').glob('*/d8' + ('.bat' if os.name == 'nt' else ''))]
         def version(p): return tuple(int(x) for x in re.findall(r'\d+', p.parent.name))
         if not javac or not platforms or not d8s:
-            raise BuildError('--external-display / --native-keyboard needs javac and an Android SDK with a platform and build-tools (set ANDROID_HOME)')
+            raise BuildError('the Java activity needs javac and an Android SDK with a platform and build-tools (set ANDROID_HOME)')
         platform, d8 = max(platforms, key=version), max(d8s, key=version)
-        out = self.aw / 'external-activity'; classes, dex = out / 'classes', out / 'dex'
+        out = self.aw / 'java-activity'; classes, dex = out / 'classes', out / 'dex'
         shutil.rmtree(out, ignore_errors=True); classes.mkdir(parents=True); dex.mkdir()
         sources = sorted((DM / 'android/java/org/nx2a').glob('*.java'))
-        nsp.run([javac, '-source', '8', '-target', '8', '-classpath', platform, '-d', classes, *sources], self.logs / 'android_external_java.log', env=self.env)
-        nsp.run([d8, '--min-api', '29', '--lib', platform, '--output', dex, *sorted(classes.rglob('*.class'))], self.logs / 'android_external_dex.log', env=self.env)
+        nsp.run([javac, '-source', '8', '-target', '8', '-classpath', platform, '-d', classes, *sources], self.logs / 'android_java.log', env=self.env)
+        nsp.run([d8, '--min-api', '29', '--lib', platform, '--output', dex, *sorted(classes.rglob('*.class'))], self.logs / 'android_dex.log', env=self.env)
+        return dex / 'classes.dex'
+
+    def external_activity(self):
+        dex = self.java_dex()
         activity = 'KeyboardExternalActivity' if self.o.native_keyboard else 'ExternalActivity'
-        return ['--dex', dex / 'classes.dex', '--activity', 'org.nx2a.' + activity if self.o.external_display else 'org.nx2a.GameActivity']
+        return ['--dex', dex, '--activity', 'org.nx2a.' + activity if self.o.external_display else 'org.nx2a.GameActivity']
+
+    def driver_picker(self, external):
+        """The driver picker's mkapk arguments: --picker, the dex (the external activity's when there is one), and the picker.tsv asset naming the game's
+        activity and the packed drivers (lib name | label | Adreno family), which org.nx2a.DriverPickerActivity reads at launch"""
+        dex = None if external else self.java_dex()
+        activity = external[external.index('--activity') + 1] if '--activity' in external else 'android.app.NativeActivity'
+        rows = ['# the driver picker (org.nx2a.DriverPickerActivity) reads this asset: the game\'s activity, then a driver= row per packed driver (lib name | label | GPU match tokens)',
+                f'activity={activity}']
+        for (_src, name, label, fam) in driver_entries(self.o.vulkan_driver):
+            rows.append(f'driver={name}|{label}|{fam}')
+        tsv = self.aw / 'picker.tsv'; tsv.write_text('\n'.join(rows) + '\n', encoding='utf-8')
+        say(f'driver picker: {len(rows) - 2} drivers, game activity {activity}')
+        return (['--dex', dex] if dex else []) + ['--picker', '--asset', f'picker.tsv={tsv}']
 
     def theme(self):
         """The on-screen gamepad's theme: only the game's own pack goes in the APK (dm/android/themes/themes.tsv maps title IDs to packs; a game with no row
@@ -838,7 +908,7 @@ class Port:
         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
                              aoc=self.aoc, sysdata=self.sysdata, language=self.lang, package=self.package, env=self.fps_env + font_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
-                             + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
+                             + ([f'DM_VK_DRIVER={driver_entries(self.o.vulkan_driver)[0][1]}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
                              files={**self.fps_files, **font_files}, profile_h=getattr(self, 'profile_h', None),
                              progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst; self.result['data'] = str(dst)

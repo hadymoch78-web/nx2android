@@ -263,6 +263,8 @@ int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uin
 static int sparse_tex(const tex_t *t) { return t->pool && nvn_sparse_pool(t->pool); }
 uint64_t g_pkg_n, g_pkg_bytes, g_pkg_ns;   // packaged texture uploads: count, bytes, CPU time (the replay's per-frame line)
 static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
+static int mem_any(const uint8_t *p, uint64_t n);   // defined below (whether any byte is non-zero); pkg_upload_ records whether an upload came from all-zero storage
+extern uint64_t g_tex_frame;   // presents so far (defined below, with the sweep); the deswizzle check in pkg_upload_ logs it
 static uint64_t pkg_hash(const uint8_t *m, size_t n) {   // FNV-1a over 8-byte words
     uint64_t h = 1469598103934665603ull; size_t i = 0;
     for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, m + i, 8); h = (h ^ w) * 1099511628211ull; }
@@ -275,7 +277,7 @@ static void pkg_upload(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     clock_gettime(CLOCK_MONOTONIC, &b); g_pkg_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); g_pkg_n++; g_pkg_bytes += t->L.size;
 }
 static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
-    { static int n; const char *e = getenv("DM_VK_LOG_UPLOADS"); if (e && atoi(e) && n < 60) { n++;   // which packaged textures are (re-)uploaded
+    { static int n; const char *e = getenv("DM_VK_LOG_UPLOADS"); if (e && atoi(e) && n < 10000) { n++;   // which packaged textures are (re-)uploaded
         VKLOG("upload: serial %llu %ux%ux%u nvn format %#x (vk %d) target %d levels %u layers %u flags %#x stride %u size %llu mem %p, tileH*100+pkg_block_h %d%s",
               (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, f->vk, t->d.target, im->levels, im->layers, t->d.flags, t->d.stride, (unsigned long long)t->L.size,
               (const void *)t->mem, (int)t->L.tileH * 100 + t->d.pkg_block_h, im->packaged > 1 ? " (again)" : ""); } }
@@ -286,6 +288,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     if ((im->pkg_sparse = sparse_tex(t))) {   // through the page table (see above); its physical pages stay protected, so no sweep releases them (pkg_mem NULL)
         im->pkg_vgen = nvn_sparse_gen(); nvn_sparse_protect(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size); im->pkg_stamp = nvn_dirty_now(); im->pkg_seen = im->pkg_stamp;
         im->pkg_span = NULL; im->pkg_mem = NULL; im->pkg_len = 0; im->pkg_released = 0;
+        im->pkg_was_zero = 0; im->pkg_zero_logged = 0;   // sparse storage is not readable directly: no zero-upload re-check
         if (!(copy = malloc(t->L.size))) return;
         uint64_t miss = nvn_sparse_copy(t->pool, copy, (uint64_t)(uintptr_t)t->mem, t->L.size); mem = copy;
         { static int n; const char *e = getenv("DM_VK_LOG_SPARSE"); if (e && atoi(e) && n < 400) { n++;   // which sparse textures are read, and how much of them was not mapped yet
@@ -295,6 +298,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
         nvn_dirty_protect(t->mem, t->L.size);
         im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp;
         im->pkg_mem = t->mem; im->pkg_len = t->L.size; im->pkg_released = 0; im->pkg_hash = pkg_hash(t->mem, t->L.size);
+        im->pkg_was_zero = !mem_any(t->mem, t->L.size); im->pkg_zero_logged = 0;   // uploaded from all-zero storage: vk_tex_ re-checks for late-arriving data
     }
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
     unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1, bpb = f->bpb;
@@ -309,6 +313,10 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
                 size_t stride = t->d.stride ? t->d.stride : pitch;
                 for (uint32_t y = 0; y < by * z; y++) memcpy(dst + y * pitch, mem + (size_t)y * stride, pitch);
             } else if (nvn_deswizzle(&t->d, lv, ly, mem, dst, pitch)) { free(blocks); free(copy); VKRED_ONCE(13, "deswizzle refused texture format %#x target %d", t->d.format, t->d.target); return; }
+            // A deswizzle that returns success yet writes zeros leaves a black image with no error: MotoGP 18 (UE4) still has black runoff and a black menu rider
+            // after every upload-path fix, so check mip 0's output against the storage it came from (the check runs only when the output is all zeros).
+            if (!linear && lv == 0 && ly == 0 && !mem_any(dst, slab) && mem_any(mem, t->L.size)) { static int nd; if (nd++ < 200) VKLOG("texture %ux%ux%u nvn format %#x serial %llu (flags %#x, tileH %u, block_h %u): deswizzle of mip 0 produced all zeros from non-zero storage (present %llu)",
+                t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long long)t->serial, t->d.flags, t->L.tileH, t->d.pkg_block_h, (unsigned long long)g_tex_frame); }
             if (blocks) { dst = vk_scratch((size_t)w * h * z * f->dbpp, 16, &sb, &so); bc_decode(f, blocks, pitch, w, h, z, dst); free(blocks); }   // (BC the device lacks)
             VkBufferImageCopy r = {so, 0, 0, {im->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, z}};
             vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
@@ -385,17 +393,68 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     im->used = g_tex_frame;
     pthread_mutex_unlock(&g_img_mu);
     if (!vk_sub_open()) return __atomic_load_n(&im->looked, __ATOMIC_ACQUIRE) ? im : NULL;   // looked up outside a submission (present): nothing can be recorded, a new image has no contents yet
+    // Bind hook (Claude step 2, point 2): every draw that binds a 2048 rider/bike texture
+    // (fmt 0x9a or 0x44) logs one line — present, serial, gpu_w, uploaded/never. Serials vary
+    // per session, so the hook keys on size + format, not serial. Correlate the present with
+    // the DM_VK_TRACE_PASS=-2 pass list to find which pass draws the leathers.
+    // Throttled: one line per texture per ~30 presents (staggered by serial).
+    if (t->d.width == 2048 && t->d.height == 2048 && (t->d.format == 0x9a || t->d.format == 0x44) && (g_tex_frame % 30) == (t->serial % 30)) {
+        static int bh; if (bh++ < 500) VKLOG("bind2048: present %llu serial %llu fmt %#x flags %#x gpu_w=%d packaged=%d",
+            (unsigned long long)g_tex_frame, (unsigned long long)t->serial, t->d.format, t->d.flags, (int)im->gpu_w, (int)im->packaged);
+    }
+    // Cubemap bind hook (Claude windscreen step 1): every draw that binds a cubemap
+    // (target 8) logs one line — present, serial, size, fmt, gpu_w, uploaded/never.
+    // The glass (windshield + helmet visor) samples a reflection cubemap; if the cube
+    // is never bound, or bound empty, the glass renders invisible. Throttled like bind2048.
+    if (t->d.target == 8 && (g_tex_frame % 30) == (t->serial % 30)) {
+        // sampled_nonzero: the cube may be CPU-uploaded but stale/partial (like the kerb).
+        // Same 16-page sampling as the step-2 fix.
+        uint64_t cnz = 0; if (t->mem) { size_t cnp = t->L.size / 4096; if (cnp == 0) cnp = 1;
+            size_t cst = cnp > 16 ? cnp / 16 : 1;
+            for (size_t p = 0, chk = 0; p < cnp && chk < 16; p += cst, chk++) {
+                const uint8_t *pg = t->mem + p * 4096; size_t plen = 4096; if (p * 4096 + plen > t->L.size) plen = t->L.size - p * 4096;
+                for (size_t i = 0; i < plen; i++) if (pg[i]) cnz++; } }
+        static int ch; if (ch++ < 200) VKLOG("bindcube: present %llu serial %llu %ux%ux%u fmt %#x flags %#x gpu_w=%d packaged=%d sampled_nonzero=%llu",
+            (unsigned long long)g_tex_frame, (unsigned long long)t->serial, t->d.width, t->d.height, im->layers, t->d.format, t->d.flags, (int)im->gpu_w, (int)im->packaged, (unsigned long long)cnz);
+    }
     int first = !__atomic_exchange_n(&im->looked, 1, __ATOMIC_ACQ_REL);   // its first use is the first lookup inside a submission, not its creation (which may have been outside one)
+    // Base rate (Claude step 2b): how common is the SPARSE flag (0x20) across ALL textures at first use?
+    // If nearly all textures carry it, the flag is not a discriminator for the never-uploaded set.
+    if (first) { static int tot, sp; tot++; if (t->d.flags & 0x20) sp++; if (tot % 500 == 0) VKLOG("base rate: %d textures at first use, %d sparse-flag (0x20) = %d%%", tot, sp, sp * 100 / tot); }
     // a texture's first use: written by the CPU since it was registered (profile tex_dirty_upload), it is CPU-written from now on, as at nvn_mtl.m's first resolution;
     // otherwise only a later nvn_ft_poll pass finds it, and its first draws read zeros
     int nvn_ft_written(const tex_t *);
+    // MotoGP 18 (UE4): textures streamed in after their first use stay black forever. The first-use gate (first && ...) gives cpu_content_tex / nvn_ft_written
+    // exactly one chance; a texture first drawn before its data streams in (storage zeros) never gets another, and the ft poll only covers textures still
+    // registered (a texture whose ft entry was consumed, or whose pages the game filled through a path the dirty tracker cannot see, is never re-checked).
+    // A texture that was never uploaded (im->packaged == 0) gets a late chance on every 10th present (staggered by serial, ~3 times a second) until its storage
+    // holds data; once uploaded, im->packaged is set and this stops. Compressed textures cannot be render targets, so a late CPU upload cannot clobber
+    // GPU-rendered content; cpu_content_tex itself refuses zero storage (mem_any) and GPU-written storage (uncompressed 2D), and nvn_ft_written only fires
+    // on a real page write.
     if (t->mem && lin_copy(im, t, f)) {}
-    else if (t->mem && (packaged_tex(t) || (first && (nvn_ft_written(t) || cpu_content_tex(t, f))))) {
+    else if (t->mem && (packaged_tex(t) || ((first || (!im->packaged && (g_tex_frame % 10) == (t->serial % 10))) && (nvn_ft_written(t) || cpu_content_tex(t, f))))) {
+        if (!first && !im->packaged) { static int nl; if (nl++ < 200) VKLOG("texture %ux%ux%u nvn format %#x serial %llu (flags %#x, pool flags %#x): data arrived after first use, uploading late (present %llu)",
+            t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long long)t->serial, t->d.flags, t->pool ? t->pool->flags : 0, (unsigned long long)g_tex_frame); }
         im->pkg_used = g_tex_frame;
         if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
         else {
             uint64_t now = nvn_dirty_now();
-            if (im->pkg_sparse) { if (nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, im->pkg_vgen, im->pkg_stamp)) pkg_upload(im, t, f); }   // mapped or written since
+            // Uploaded as zeros before its data arrived (packaged_tex was true at first use, so the upload ran on empty storage), and the dirty tracker never saw
+            // the arrival: re-check the storage itself, throttled like the late first upload above. MotoGP 18 (UE4) leaves some streamed textures black this way:
+            // the re-upload below only fires on a dirty span, and a fill the tracker cannot see leaves the zero upload in place forever. Not for GPU-written
+            // images: the GPU owns those, and the CPU storage is not authoritative for them.
+            if (im->pkg_was_zero && !im->gpu_w && (g_tex_frame % 30) == (t->serial % 30)) {
+                if (mem_any(t->mem, t->L.size)) { static int nz; if (nz++ < 200) VKLOG("texture %ux%ux%u nvn format %#x serial %llu (flags %#x, pool flags %#x): uploaded as zeros, storage now has data the dirty tracker never saw, re-uploading (present %llu)",
+                    t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long long)t->serial, t->d.flags, t->pool ? t->pool->flags : 0, (unsigned long long)g_tex_frame);
+                    pkg_upload(im, t, f); }
+                else if (!im->pkg_zero_logged) { im->pkg_zero_logged = 1; static int zl; if (zl++ < 200) VKLOG("texture %ux%ux%u nvn format %#x serial %llu (flags %#x, pool flags %#x): uploaded as zeros and storage still zero (present %llu)",
+                    t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long long)t->serial, t->d.flags, t->pool ? t->pool->flags : 0, (unsigned long long)g_tex_frame); }
+            }
+            if (im->pkg_released) {   // write protection was given up by vk_tex_sweep: nvn_dirty_since_span below cannot see writes to unprotected pages, so a texture whose pool was rewritten after release would keep stale (possibly zero) content forever. Re-upload on re-use, as the sweep's comment promises; keep the GPU-written guard from the dirty branch.
+                if (im->gpu_w && pkg_hash(t->mem, t->L.size) == im->pkg_hash) { nvn_dirty_protect(t->mem, t->L.size); im->pkg_stamp = nvn_dirty_now(); im->pkg_released = 0; }
+                else pkg_upload(im, t, f);
+            }
+            else if (im->pkg_sparse) { if (nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, im->pkg_vgen, im->pkg_stamp)) pkg_upload(im, t, f); }   // mapped or written since
             else if (now != im->pkg_seen && nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp)) {   // pages written since the upload
                 // The GPU wrote the image since (a compute shader's image stores, a copy, a render) and its storage still holds the bytes of the upload: the writes were around
                 // it on shared pages, and an upload would put the CPU's bytes over the GPU's. Monster Hunter Rise's spot light profiles (512x1x64 R16F, written by a compute
@@ -408,6 +467,42 @@ static vkimg_t *vk_tex_(const tex_t *t) {
             im->pkg_seen = now;
         }
     } else if (first) vk_tex_prepare(vk_upload_cmd(), im);
+    // Diagnostic (Claude step 1) + experimental fix (Claude step 2c). A texture drawn while never
+    // uploaded: log the pool memory contents once, and upload it as soon as non-zero data appears.
+    // The fix RE-CHECKS every ~10 presents (staggered by serial): a texture all-zero at first draw
+    // (e.g. serial 9941, a 2048 streamed in late) gets uploaded when its data finally arrives,
+    // instead of staying black forever because the one-shot check missed it. Once uploaded
+    // (im->packaged), this block stops firing; later writes re-upload through the packaged branch
+    // (dirty span / sparse_since).
+    // Sampling (Claude step 2, point 3): the content check samples up to 16 scattered 4KB pages
+    // instead of scanning the whole texture (a 2048 is 22MB). If ANY sampled page has non-zero
+    // data, the texture is uploaded.
+    // gpu_w transition (Claude step 2, point 1): if a never-uploaded texture LATER becomes
+    // GPU-written (render target), that is logged once — it means the black is in the writing
+    // pass, not the upload path, and the fix must skip it.
+    if (t->mem && !im->packaged && (g_tex_frame % 10) == (t->serial % 10)) {
+        if (im->gpu_w) { if (!im->unpkg_logged) { im->unpkg_logged = 1; static int gw; if (gw++ < 50) VKLOG("texture %ux%ux%u nvn format %#x serial %llu (flags %#x): never uploaded but GPU-written (present %llu) — render target, upload fix skipped",
+            t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long long)t->serial, t->d.flags, (unsigned long long)g_tex_frame); } return im; }
+        // Sample up to 16 scattered 4KB pages for non-zero content.
+        uint64_t nz = 0; size_t npages = t->L.size / 4096; if (npages == 0) npages = 1;
+        size_t step = npages > 16 ? npages / 16 : 1;
+        for (size_t p = 0, checked = 0; p < npages && checked < 16; p += step, checked++) {
+            const uint8_t *pg = t->mem + p * 4096; size_t plen = 4096; if (p * 4096 + plen > t->L.size) plen = t->L.size - p * 4096;
+            for (size_t i = 0; i < plen; i++) if (pg[i]) nz++;
+        }
+        size_t hlen = t->L.size < 4096 ? (size_t)t->L.size : 4096;
+        uint64_t h_first = pkg_hash(t->mem, hlen);
+        uint64_t h_last = pkg_hash(t->mem + t->L.size - hlen, hlen);
+        if (!im->unpkg_logged) { im->unpkg_logged = 1; static int nu; if (nu++ < 200) {
+            int pkg = packaged_tex(t), cpu = cpu_content_tex(t, f);
+            VKLOG("texture %ux%ux%u nvn format %#x serial %llu (flags %#x, pool flags %#x): drawn while never uploaded (present %llu) [keyed=%d has_layout=%d packaged=%d cpu_content=%d mem=%p size=%llu sampled_nonzero=%llu hash_first=%llx hash_last=%llx]",
+                t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long long)t->serial, t->d.flags, t->pool ? t->pool->flags : 0, (unsigned long long)g_tex_frame,
+                keyed, (int)t->has_layout, pkg, cpu, (const void *)t->mem, (unsigned long long)t->L.size, (unsigned long long)nz, (unsigned long long)h_first, (unsigned long long)h_last);
+        } }
+        if (nz > 0) { im->pkg_used = g_tex_frame; if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
+            static int fx; if (fx++ < 200) VKLOG("texture %ux%ux%u nvn format %#x serial %llu (flags %#x): step-2 fix uploaded, %llu sampled non-zero bytes (present %llu)",
+                t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long long)t->serial, t->d.flags, (unsigned long long)nz, (unsigned long long)g_tex_frame); }
+    }
     return im;
 }
 // Packaged textures give up their write protection (nvn_dirty_release; drawn again, they are uploaded and protected again) when not drawn for PKG_IDLE presents, and the

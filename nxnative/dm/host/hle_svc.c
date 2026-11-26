@@ -25,6 +25,8 @@ static _Atomic uint64_t *g_alias_bits;   // alias region page bitmap (alias_page
 static uint8_t *g_stack; static size_t g_stack_cap;
 // The address lies in the guest address block (every guest thread stack is here: the game's own heap or the stack region); the big-stack entry (hle_bigstack.c) uses it to decide whether to switch stacks
 int dm_guest_as_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_as; return g_as && a >= b && a - b < RESERVE; }
+// The address lies in the guest thread-stack region (inside the guest address block): a stack copy of a value is transient, gone when the function returns (the box poke skips it)
+int dm_guest_stack_contains(uintptr_t a) { uintptr_t b = (uintptr_t)g_stack; return g_stack && a >= b && a - b < g_stack_cap; }
 
 static void *alias_windows_thread(void *arg);
 static void mem_init(void) {

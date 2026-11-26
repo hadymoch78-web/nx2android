@@ -1,6 +1,6 @@
 // nn::oe (application operating environment): on the real device the console state is queried through the am/oe services; the host gives fixed state directly.
 // oe::Initialize is in hle_sdkinit.c, not here.
-// Environment switches: DM_OPMODE=0 handheld / 1 console (default: the profile's op_mode, console unless set; console corresponds to the console-mode render profile); DM_LANG=language code (default en-US; the iOS app sets it from the IPA's DMLanguage, main.m).
+// Environment switches: DM_OPMODE=0 handheld / 1 console (default: the profile's op_mode, console unless set; console corresponds to the console-mode render profile); DM_LANG=language code (default en-US; the iOS app sets it from the IPA's DMLanguage, main.m); DM_DISPLAY_RES=WxH overrides the default display resolution the game is told (a phone panel's aspect, e.g. 1600x720).
 #include "hle.h"
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
@@ -52,6 +52,7 @@ void dm_set_opmode(int m) {   // called by the front end (overheat downgrade etc
     int old = dm_opmode(); if (old == m) return;
     g_opmode = m;
     LOG("oe operation mode %d → %d", old, m);
+    dm_evt8_log("oe::operation mode %d -> %d", old, m);
     dm_hid_opmode_changed();   // player 1's controller moves between the Handheld and No1 npads (hle_hid.c)
     if (g_ntf_opmode) mq_push(MSG_OPMODE);
     if (g_ntf_perfmode) mq_push(MSG_PERFMODE);
@@ -74,6 +75,7 @@ void dm_focus_set(int st) {
     if (st == 1) atomic_store(&g_focus_in_ns, now_ns());
     if (atomic_exchange(&g_focus, st) == st) return;
     LOG("oe focus state → %d", st);
+    dm_evt8_log("oe::focus state -> %d", st);
     if (focus_notifies()) mq_push(MSG_FOCUS);
 }
 static int opmode(void) { return dm_opmode(); }
@@ -130,8 +132,12 @@ HLE_FORCE("_ZN2nn2oe18GetPerformanceModeEv", "performance mode query; same as th
 static unsigned char g_cpu_oc;
 HLE_FORCE("_ZN2nn2oe21IsCpuOverclockEnabledEv", "CPU overclock state (through apm): what SetCpuOverclockEnabled set, off at start", unsigned, h_oe_CpuOc, void) { return g_cpu_oc; }
 HLE_FORCE("_ZN2nn2oe22SetCpuOverclockEnabledEb", "CPU overclock switch (through apm); the host does not scale clocks", void, h_oe_SetCpuOc, unsigned on) { g_cpu_oc = on & 0xff; }
-HLE_FORCE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", "default display resolution: 1920x1080 docked, 1280x720 handheld", void, h_oe_DefRes, int *w, int *h) {
+HLE_FORCE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", "default display resolution: DM_DISPLAY_RES=WxH overrides, else 1920x1080 docked, 1280x720 handheld", void, h_oe_DefRes, int *w, int *h) {
+    const char *r = getenv("DM_DISPLAY_RES"); int rw = 0, rh = 0;
+    if (r && sscanf(r, "%dx%d", &rw, &rh) == 2 && rw >= 320 && rh >= 320 && rw <= 4096 && rh <= 4096) { if (w) *w = rw; if (h) *h = rh; return; }
     int con = opmode() == 1; if (w) *w = con ? 1920 : 1280; if (h) *h = con ? 1080 : 720;
+    { static int seen, lw, lh; int w0 = con ? 1920 : 1280, h0 = con ? 1080 : 720;
+      if (!seen || lw != w0 || lh != h0) { seen = 1; lw = w0; lh = h0; if (dm_vi_arg_on()) LOG("vi-arg: GetDefaultDisplayResolution() -> %dx%d", w0, h0); dm_evt8_log("oe::GetDefaultDisplayResolution() -> %dx%d", w0, h0); } }
 }
 HLE_FORCE("_ZN2nn2oe38GetDefaultDisplayResolutionChangeEventEPNS_2os11SystemEventE", "default display resolution change event: bound, never signaled (the operation mode notification carries the change)",
           void, h_oe_DefResEv, void *ev) { hle_bind_system_event(ev, 0); }
@@ -181,6 +187,7 @@ static pthread_once_t g_oe_once = PTHREAD_ONCE_INIT;
 HLE_FORCE("_ZN2nn2oe20GetCurrentFocusStateEv", "foreground / background state; driven by the front end's dm_focus_set", int, h_oe_GetFocus, void) { return g_focus; }
 HLE_FORCE("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", "focus handling mode; 1 and 2 get focus notifications, 0 and 3 none (see g_focus_mode)", void, h_oe_SetFocusMode, int m) {
     atomic_store(&g_focus_mode, m); LOG("oe::SetFocusHandlingMode %d (%s)", m, focus_notifies() ? "focus notifications" : "suspended out of focus, no focus notifications");
+    dm_evt8_log("oe::SetFocusHandlingMode(%d)", m);
 }
 
 // Notification: returns bool (w0), the host has no system notifications

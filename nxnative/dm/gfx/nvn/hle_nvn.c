@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <stdarg.h>
 #if TARGET_OS_OSX
 #define DM_MEM_CAP_DEFAULT_GB 24
 #else
@@ -355,12 +356,41 @@ static flush_tex *g_ft; static size_t g_nft, g_cft; static pthread_mutex_t g_ft_
 static void ft_add(const tex_t *t) {
     // Buffer textures are views onto the pool buffer the GPU reads directly (tex_mtl in nvn_mtl.m); an upload would push Age of Calamity's 1,048,576-texel R32F one through tex_desc, past Metal's 2D limit
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
-        (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE))) return;
+        (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) {
+        // MotoGP 18 2048 diag: why a large texture never enters the flush list
+        // NOTE 2026-11-21: NVN_TEXTURE_FLAGS_COMPRESSIBLE removed from the exclusion above.
+        // Compressible sampled textures (e.g. MotoGP 18 pit-scene 2048 fmt 0x9a, flags 0x8)
+        // are CPU-loaded like any other texture; the pool memory the CPU writes is the plain
+        // uncompressed data, so ft-tracking + uploading it is correct. Render targets stay
+        // excluded via LINEAR_RENDER_TARGET. Without this, a compressible texture whose data
+        // arrives after first draw is never uploaded (no ft tracking, no re-check).
+        if (t->d.width >= 2048 || t->d.height >= 2048) { static int n; if (n++ < 20) LOG("[dm] [vk] ft_add SKIP serial %llu %ux%u fmt %#x: flush=%d mem=%p pool=%p layout=%d target=%d poolflags=%#x texflags=%#x",
+            (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, (int)DM_GAME_TEX_FLUSH_UPLOAD, (const void *)t->mem, (const void *)t->pool,
+            (int)t->has_layout, (int)t->d.target, t->pool ? t->pool->flags : 0, t->d.flags); }
+        return;
+    }
     pthread_mutex_lock(&g_ft_mu);
     if (g_nft == g_cft && !(g_ft = realloc(g_ft, (g_cft = g_cft ? 2 * g_cft : 1024) * sizeof *g_ft))) die("flush_tex allocation failed");
     uint64_t st = nvn_dirty_now(); if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
     g_ft[g_nft++] = (flush_tex){t->mem, t->L.size, *t, st, nvn_dirty_span(t->mem, t->L.size)};
     pthread_mutex_unlock(&g_ft_mu);
+    // MotoGP 18 2048 diag: confirm a large texture entered the flush list, and whether
+    // its span resolved to a tracked range (NULL span = dirty checks always "dirty",
+    // but protect already no-op'd above if the range was missing).
+    if (t->d.width >= 2048 || t->d.height >= 2048) { static int n; if (n++ < 20) LOG("[dm] [vk] ft_add OK serial %llu %ux%u fmt %#x mem=%p size=%llu span=%p",
+        (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, (const void *)t->mem, (unsigned long long)t->L.size,
+        nvn_dirty_span(t->mem, t->L.size)); }
+}
+// Whether any byte in the range is non-zero (stops at the first). A texture
+// whose pages were flagged dirty by a write to a page it shares with another
+// range still holds zeros: marking it CPU-written then uploads zeros and drops
+// its tracking entry, so a later real write is never seen and the texture
+// stays black. The mark waits until data has actually arrived.
+static int ft_mem_any(const uint8_t *p, uint64_t n) {
+    uint64_t i = 0, v;
+    for (; i + 8 <= n; i += 8) { memcpy(&v, p + i, 8); if (v) return 1; }
+    for (; i < n; i++) if (p[i]) return 1;
+    return 0;
 }
 // Under asynchronous replay a texture Finalized (or initialized again) between submit and replay is still drawn by that submission, and its first use there (nvn_ft_written) needs
 // the entry: the deletion waits for the replay of the first job queued after it (ft_del_drain, submit_now); without a replay thread it is at once
@@ -398,7 +428,10 @@ int nvn_ft_written(const tex_t *t) {
     if (!DM_GAME_TEX_DIRTY_UPLOAD || !t->serial) return 0;
     int r = 0; pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == t->serial) {
-        if (nvn_dirty_since_span(g_ft[i].span, g_ft[i].mem, g_ft[i].size, g_ft[i].stamp)) { r = 1; g_ft[i] = g_ft[--g_nft]; }
+        if (nvn_dirty_since_span(g_ft[i].span, g_ft[i].mem, g_ft[i].size, g_ft[i].stamp)) {
+            if (ft_mem_any(g_ft[i].mem, g_ft[i].size)) { r = 1; g_ft[i] = g_ft[--g_nft]; }
+            else g_ft[i].stamp = nvn_dirty_now();   // dirty flag was a shared page: consume it, keep tracking for a real write
+        }
         break; }
     pthread_mutex_unlock(&g_ft_mu);
     if (r) { ft_log(t, "pages written (first use)"); mtl_tex_cpu_written(t); }
@@ -423,8 +456,13 @@ void nvn_ft_poll(void) {
         if (cur >= g_nft) cur = 0;
         scanned += g_ft[cur].size; left--;
         if (nvn_dirty_since_span(g_ft[cur].span, g_ft[cur].mem, g_ft[cur].size, g_ft[cur].stamp)) {
-            if (nhit == chit && !(hit = realloc(hit, (chit = chit ? 2 * chit : 64) * sizeof *hit))) die("nvn_ft_poll allocation failed");
-            hit[nhit++] = g_ft[cur].t; g_ft[cur] = g_ft[--g_nft];
+            if (ft_mem_any(g_ft[cur].mem, g_ft[cur].size)) {
+                if (nhit == chit && !(hit = realloc(hit, (chit = chit ? 2 * chit : 64) * sizeof *hit))) die("nvn_ft_poll allocation failed");
+                hit[nhit++] = g_ft[cur].t; g_ft[cur] = g_ft[--g_nft];
+            } else {
+                g_ft[cur].stamp = now;   // dirty flag was a shared page: consume it, keep tracking for a real write
+                cur++;
+            }
         } else cur++;
     }
     pthread_mutex_unlock(&g_ft_mu);
@@ -1000,7 +1038,26 @@ NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, c
     p_viewports *r = REC(c, OP_VIEWPORTS, p_viewports); r->first = first; r->n = n;
     for (int i = 0; i < n; i++) memcpy(r->v[i], v + 4 * i, 16);
 }
-NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
+// DM_VK_SCISSOR_CENSUS=N: the guest caller of each distinct scissor value, logged once at record time — who sets the boxed scissor. The
+// return address is the guest's (the NVN thunk tail-jumps to this function), formatted as module+offset by crash_addr_str; the frame-pointer
+// chain (dm_backtrace, which reads through vm_read_overwrite and fails instead of faulting) shows the callers above it. The (0,0,8192,8192)
+// sentinel — a scissor larger than any target, i.e. no clip — is skipped, and so is the record-time question of which target the scissor
+// will apply to: the RT-relative boxed-ness comes from the census in gfx_vk_exec.c. Capped at 64 distinct values.
+static void scissor_caller(int x, int y, int w, int h, uint64_t ra, uint64_t fp) {
+    const char *e = getenv("DM_VK_SCISSOR_CENSUS"); if (!e || !atoi(e)) return;
+    if (x == 0 && y == 0 && w >= 8192 && h >= 8192) return;
+    static struct { int x, y, w, h; } seen[64]; static int nseen, nother;
+    for (int i = 0; i < nseen; i++) if (seen[i].x == x && seen[i].y == y && seen[i].w == w && seen[i].h == h) return;
+    if (nseen >= 64) { if (!nother++) LOG("scissor: caller log full (64 distinct values): further values not traced"); return; }
+    seen[nseen].x = x; seen[nseen].y = y; seen[nseen].w = w; seen[nseen].h = h; nseen++;
+    char at[192]; crash_addr_str(at, sizeof at, ra);
+    LOG("scissor: SetScissor(%d,%d %dx%d) from %s", x, y, w, h, at);
+    dm_backtrace(fp);
+}
+NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) {
+    scissor_caller(x, y, w, h, (uint64_t)__builtin_return_address(0), (uint64_t)__builtin_frame_address(0));
+    *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h};
+}
 NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
     *REC(c, OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){(const prog_t *)p, stages};
@@ -1418,7 +1475,7 @@ __attribute__((constructor)) static void nvn_nops_register(void) {
 #define WB(b) ((win_builder_t *)(b))
 NVN(nvnWindowBuilderSetDefaults, void, NVNwindowBuilder *b) { NVNdevice *dev = WB(b)->dev; memset(b, 0, sizeof(win_builder_t)); WB(b)->dev = dev; WB(b)->interval = 1; }
 NVN(nvnWindowBuilderSetDevice, void, NVNwindowBuilder *b, NVNdevice *d) { WB(b)->dev = d; }
-NVN(nvnWindowBuilderSetNativeWindow, void, NVNwindowBuilder *b, NVNnativeWindow w) { WB(b)->native = w; }
+NVN(nvnWindowBuilderSetNativeWindow, void, NVNwindowBuilder *b, NVNnativeWindow w) { WB(b)->native = w; dm_evt8_log("WindowBuilderSetNativeWindow %p", (void *)w); }
 NVN(nvnWindowBuilderSetTextures, void, NVNwindowBuilder *b, int n, NVNtexture *const *t) {
     if (n < 0 || n > 4) { LOG("[RED] WindowBuilderSetTextures count %d", n); n = n < 0 ? 0 : 4; }
     WB(b)->ntex = n; for (int i = 0; i < n; i++) WB(b)->tex[i] = t[i];
@@ -1433,16 +1490,31 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
     for (int i = 0; i < o->ntex; i++) if (o->tex[i]) mtl_xv_window_tex(CTX(o->tex[i])->serial);
     LOG("[nvn] WindowInitialize swap chain %d textures, interval %d, first %dx%d format %#x", o->ntex, o->interval,
         o->ntex ? (int)CTX(o->tex[0])->d.width : 0, o->ntex ? (int)CTX(o->tex[0])->d.height : 0, o->ntex ? CTX(o->tex[0])->d.format : 0);
+    {   // DM_LOG_VI_ARGS=1: first call + changes (a second window, or a re-init at another size)
+        static int seen, ln, li, lw, lh; static unsigned lf; int w0 = o->ntex ? (int)CTX(o->tex[0])->d.width : 0, h0 = o->ntex ? (int)CTX(o->tex[0])->d.height : 0;
+        unsigned f0 = o->ntex ? CTX(o->tex[0])->d.format : 0;
+        if (dm_vi_arg_on() && (!seen || ln != o->ntex || li != o->interval || lw != w0 || lh != h0 || lf != f0)) {
+            seen = 1; ln = o->ntex; li = o->interval; lw = w0; lh = h0; lf = f0;
+            LOG("vi-arg: WindowInitialize swap chain %d textures, interval %d, first %dx%d format %#x", o->ntex, o->interval, w0, h0, f0);
+        }
+        dm_evt8_log("WindowInitialize %d textures interval %d first %dx%d fmt %#x", o->ntex, o->interval, w0, h0, f0);
+    }
     return 1;
 }
 NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t *)w)->interval; }   // Link's Awakening reads it back every frame
 NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) {   // the caller in the log: where a 60 fps cut starts looking (Pokémon Legends: Z-A)
-    if (((win_t *)w)->interval != v) { char at[96]; crash_addr_str(at, sizeof at, (uint64_t)__builtin_return_address(0)); LOG("[nvn] the game sets present interval %d → %d (from %s)", ((win_t *)w)->interval, v, at); }
+    int old = ((win_t *)w)->interval;
+    if (old != v) { char at[96]; crash_addr_str(at, sizeof at, (uint64_t)__builtin_return_address(0)); LOG("[nvn] the game sets present interval %d → %d (from %s)", old, v, at); }
+    { static int seen, lv; if (dm_vi_arg_on() && (!seen || lv != v)) { seen = 1; lv = v; LOG("vi-arg: WindowSetPresentInterval %d", v); } }
+    if (old != v) dm_evt8_log("WindowSetPresentInterval %d -> %d", old, v);
     ((win_t *)w)->interval = v;
 }
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
-    if (memcmp(o->crop, v, sizeof v)) LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh);
+    int changed = memcmp(o->crop, v, sizeof v) != 0;
+    if (changed) LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh);
+    { static int seen, lx, ly, lw, lh; if (dm_vi_arg_on() && (!seen || lx != x || ly != y || lw != ww || lh != hh)) { seen = 1; lx = x; ly = y; lw = ww; lh = hh; LOG("vi-arg: WindowSetCrop %d,%d %dx%d", x, y, ww, hh); } }
+    if (changed) dm_evt8_log("WindowSetCrop %d,%d %dx%d", x, y, ww, hh);
     memcpy(o->crop, v, sizeof v);
 }
 NVN(nvnWindowGetCrop, void, const NVNwindow *w, NVNrectangle *r) {   // Bayonetta 3 reads it back every few frames; before any SetCrop it is the whole first texture, as NVN starts it
@@ -1472,10 +1544,40 @@ static uint64_t g_frame;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 static uint64_t g_fs_start, g_fs_wait;   // frame step (fstep_tick): when the first acquire after a present returned (the frame's start, 0 = none yet), and its pacing wait
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
+// DM_LOG_VI_ARGS=1: Window/vi argument logging and the HLE display-event ring, for the first 100 frames only — the boot window in which the menu rect
+// appears. Read live (no caching): the switch is set in env.txt before boot, and a DM_CTL "env" line can still turn it on mid-run.
+int dm_vi_arg_on(void) { const char *e = getenv("DM_LOG_VI_ARGS"); return e && atoi(e) && dm_nvn_frame_count() < 100; }
+// HLE display-event ring: the last 32 display-related host calls (vi / NVN window / oe), dumped once at present 30 (gfx_vk_present.c). Written from any
+// guest thread (mutex); each entry carries the frame it happened on. Silent unless DM_LOG_VI_ARGS=1. Named dm_evt8_* (not dm_evt_*) so it cannot collide
+// with the scan's own event ring in nvn_dirty.c, which the same rebuild carries.
+#define EVT8_N 32
+static struct { uint64_t frame; char text[160]; } g_evt8[EVT8_N];
+static int g_evt8_head, g_evt8_n; static pthread_mutex_t g_evt8_mu = PTHREAD_MUTEX_INITIALIZER;
+void dm_evt8_log(const char *fmt, ...) {
+    if (!dm_vi_arg_on()) return;
+    char buf[160]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    pthread_mutex_lock(&g_evt8_mu);
+    int i = g_evt8_head; g_evt8[i].frame = dm_nvn_frame_count(); snprintf(g_evt8[i].text, sizeof g_evt8[i].text, "%s", buf);
+    g_evt8_head = (g_evt8_head + 1) % EVT8_N; if (g_evt8_n < EVT8_N) g_evt8_n++;
+    pthread_mutex_unlock(&g_evt8_mu);
+}
+void dm_evt8_dump(void) {
+    const char *e = getenv("DM_LOG_VI_ARGS"); if (!e || !atoi(e)) return;   // off: silent, not even the empty marker
+    pthread_mutex_lock(&g_evt8_mu);
+    int n = g_evt8_n, head = g_evt8_head;
+    for (int k = 0; k < n; k++) { int i = (head - n + k + EVT8_N) % EVT8_N; LOG("scan-evt: frame %llu: %s", (unsigned long long)g_evt8[i].frame, g_evt8[i].text); }
+    if (!n) LOG("scan-evt: (no display events recorded)");
+    pthread_mutex_unlock(&g_evt8_mu);
+}
 extern uint64_t g_t0_ns;   // Host process start point (main.c; same base as the UIMSG timestamps)
+// The serial of the window texture the latest acquire handed out (dm_is_win_tex): the frame's UI pass draws into it. Set at every acquire
+// (there can be several within one frame; the last one before the frame's submissions is the frame's texture).
+static uint64_t g_acq_win_serial; static int g_acq_win_set;
+int dm_is_win_tex(const tex_t *t) { return g_acq_win_set && t && t->serial == g_acq_win_serial; }
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     win_t *o = (win_t *)w;
     *idx = o->ntex ? o->next++ % o->ntex : 0;
+    if (*idx < o->ntex && o->tex[*idx]) { g_acq_win_serial = CTX(o->tex[*idx])->serial; g_acq_win_set = 1; }
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock
     uint64_t at = *idx < 4 ? o->avail[*idx] : 0, now = dm_detclock_enabled() ? guest_ns() : now_ns(), wait = at > now ? at - now : 0, pace_ns = 0;
     if (!dm_detclock_enabled()) {   // Register the acquire thread as a time-constraint thread (no longer registered only when it "arrived early": it must also declare itself when it is constantly behind in the hot state)
@@ -1756,6 +1858,7 @@ static _Atomic uint64_t g_itv2_since;   // start of the game's current run of in
 // (fstep_tick, nvn_fstep.h) and presents follow the hold k it decides with it
 __attribute__((weak)) uint8_t *dm_fps_state;   // loader.c; graphics unit tests have no loader
 __attribute__((weak)) void dm_fps_lock_tick(void) {}   // hle_fpslock.c: engine frame limits in game memory (Monster Hunter Rise); graphics unit tests have no host
+__attribute__((weak)) void dm_watch_tick(uint64_t presents) { (void)presents; }   // nvn_dirty.c: DM_WATCH_RECT write watch; graphics unit tests have no host
 static int fps_step_cap(void) {
     if (!dm_fps_state) return 0;
     uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float t; memcpy(&t, &b, sizeof t);
@@ -1904,6 +2007,8 @@ static void dyn_scale_tick(uint64_t presents) {
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++; SEQ("present %d", idx);
     dm_fps_lock_tick();
+    dm_watch_tick(o->presents);
+    dm_poke_tick(o->presents);
     if (dm_fps_state) { static int was; int c = fps_step_cap(); if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? " (prerendered movie)" : ""); was = c; } }
     if (dm_fps_state) dyn_scale_tick(o->presents);
     if (dm_fps_state && o->presents % 30 == 0 && !dyn_scale_on()) {   // DM_RENDER_SCALE changed while the game runs (a DM_CTL "env" line): the render-scale stubs read the state page every frame

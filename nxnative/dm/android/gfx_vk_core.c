@@ -141,15 +141,25 @@ void vk_init(void) {
         Dl_info di; char dir[512] = "", dirs[520] = "";   // the APK's extracted libraries (mkapk.py: extractNativeLibs), where adrenotools finds its hooks and the driver
         if (dladdr((void *)vk_init, &di) && di.dli_fname && strrchr(di.dli_fname, '/')) {
             snprintf(dir, sizeof dir, "%.*s", (int)(strrchr(di.dli_fname, '/') - di.dli_fname), di.dli_fname); snprintf(dirs, sizeof dirs, "%s/", dir); }
+        // DM_VK_DRIVER_DIR=<dir>: a custom driver directory (the launcher's picker copies a user-chosen .so into the app's internal files dir and names it here).
+        // The hooks still load from the APK's libraries (dir); only the driver itself comes from this directory. adrenotools requires it to be internal
+        // storage, never sdcard. Unset, the driver loads from the APK's libraries as before.
+        const char *cdir = getenv("DM_VK_DRIVER_DIR");
+        char cdirs[520] = "";
+        const char *drvdir = dirs;   // the directory adrenotools loads the driver from
+        if (cdir && *cdir) {
+            size_t n = strlen(cdir);
+            if (n < sizeof cdirs - 2) { snprintf(cdirs, sizeof cdirs, "%s%s", cdir, (n && cdir[n-1] == '/') ? "" : "/"); drvdir = cdirs; }
+        }
         void *at = dlopen("libadrenotools.so", RTLD_NOW | RTLD_LOCAL);
         void *(*open_vk)(int, int, const char *, const char *, const char *, const char *, const char *, void **) =
             at ? (void *(*)(int, int, const char *, const char *, const char *, const char *, const char *, void **))dlsym(at, "adrenotools_open_libvulkan") : NULL;
         if (!open_vk || !*dir) VKLOG("[RED] DM_VK_DRIVER %s: no libadrenotools in the APK (%s); the system's driver instead", drv, at ? "no adrenotools_open_libvulkan" : dlerror());
-        else if (!(lib = open_vk(RTLD_NOW | RTLD_LOCAL, 1 /* ADRENOTOOLS_DRIVER_CUSTOM */, NULL, dir, dirs, drv, NULL, NULL)))
-            VKLOG("[RED] DM_VK_DRIVER %s: adrenotools could not load it from %s; the system's driver instead", drv, dir);
+        else if (!(lib = open_vk(RTLD_NOW | RTLD_LOCAL, 1 /* ADRENOTOOLS_DRIVER_CUSTOM */, NULL, dir, drvdir, drv, NULL, NULL)))
+            VKLOG("[RED] DM_VK_DRIVER %s: adrenotools could not load it from %s; the system's driver instead", drv, drvdir);
         else if (!(p_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr")) || !drv_has_gpu(p_vkGetInstanceProcAddr)) {
             VKLOG("[RED] DM_VK_DRIVER %s: no Vulkan 1.3 GPU through it; the system's driver instead", drv); lib = NULL; }   // (left loaded: a driver does not always unload cleanly)
-        else VKLOG("Vulkan driver %s through adrenotools, not the system's (%s)", drv, dir);
+        else VKLOG("Vulkan driver %s through adrenotools, not the system's (%s)", drv, drvdir);
     }
     if (!lib) {
         if (!(lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL))) die("[vk] libvulkan.so: %s", dlerror());
@@ -982,7 +992,7 @@ static void wait_fence(uint64_t f) {
     if (!f) return;
     if (!V.has_timeline) { mtl_wait(f, ~0ull); return; }
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, NULL, 0, 1, &g_timeline, &f};
-    VkResult r = vkWaitSemaphores(V.dev, &wi, UINT64_MAX); if (r != VK_SUCCESS) die("[vk] GPU timeline wait did not complete: %d", r);
+    VkResult r = vkWaitSemaphores(V.dev, &wi, UINT64_MAX); if (r != VK_SUCCESS) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] GPU timeline wait did not complete: %d", r); }
 }
 // The slot's command buffers are reset on the completion thread once its submission is done (completion_main), not when the replay begins them again: an
 // implicit reset at vkBeginCommandBuffer took 7% of Xenoblade Chronicles 3's replay thread at a submission's start and more at every part (its battles

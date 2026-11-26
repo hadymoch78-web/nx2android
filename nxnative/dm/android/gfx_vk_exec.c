@@ -65,6 +65,75 @@ static int g_var_now;   // the bisection's change for the draw being recorded (s
 static int g_tracing;   // the draw being recorded is the one the bisection found (its descriptors are logged)
 // replay counters, printed by gfx_vk_present.c every 600 presents (draws done and skipped by reason, passes, clears folded into load ops, dispatches)
 struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, dispatches, pipes_built, rt_kept, ns_exec, ns_desc, ns_pipe, max_pass_draws; } g_vkst; static uint64_t g_pass_draws;   // ns_*: time in the replay, its descriptor sets, its pipeline keys and lookups
+// Viewport census (DM_VK_VIEWPORT_CENSUS=N, read live each submission in x_read): every N presents, one line per distinct (render-target size, depth,
+// viewport, scissor) bucket with its draw count since the last census — what the game actually draws with, without tracing one pass (TRACE_SIZE fired on
+// drawless passes and logged nothing). Off when unset or 0; N=600 is a good first value. The draw path is single-threaded, so the table needs no lock,
+// like the replay counters above.
+#define VPCENSUS_MAX 64
+extern uint64_t g_tex_frame;   // presents so far (gfx_vk_tex.c); the declaration below is past this block
+static struct { uint32_t w, h; int depth, sc_set; int32_t vpx, vpy, vpw, vph, scx, scy, scw, sch; uint64_t n; } g_vpcensus[VPCENSUS_MAX];
+static int g_vpcensus_n, g_x_vpcensus; static uint64_t g_vpcensus_next, g_vpcensus_other;
+static void vpcensus_count(void) {
+    if (!g_x_vpcensus) return;
+    int32_t vpx = (int32_t)lroundf(S.vp[0][0]), vpy = (int32_t)lroundf(S.vp[0][1]), vpw = (int32_t)lroundf(S.vp[0][2]), vph = (int32_t)lroundf(S.vp[0][3]);
+    int i = 0;
+    for (; i < g_vpcensus_n; i++) {
+        if (g_vpcensus[i].w == S.pass_w && g_vpcensus[i].h == S.pass_h && g_vpcensus[i].depth == (S.dfmt != 0) && g_vpcensus[i].sc_set == S.sc_set &&
+            g_vpcensus[i].vpx == vpx && g_vpcensus[i].vpy == vpy && g_vpcensus[i].vpw == vpw && g_vpcensus[i].vph == vph &&
+            g_vpcensus[i].scx == S.sc.x && g_vpcensus[i].scy == S.sc.y && g_vpcensus[i].scw == S.sc.w && g_vpcensus[i].sch == S.sc.h) break;
+    }
+    if (i == g_vpcensus_n) {
+        if (g_vpcensus_n >= VPCENSUS_MAX) { g_vpcensus_other++; return; }
+        g_vpcensus_n++;
+        g_vpcensus[i].w = S.pass_w; g_vpcensus[i].h = S.pass_h; g_vpcensus[i].depth = S.dfmt != 0; g_vpcensus[i].sc_set = S.sc_set;
+        g_vpcensus[i].vpx = vpx; g_vpcensus[i].vpy = vpy; g_vpcensus[i].vpw = vpw; g_vpcensus[i].vph = vph;
+        g_vpcensus[i].scx = S.sc.x; g_vpcensus[i].scy = S.sc.y; g_vpcensus[i].scw = S.sc.w; g_vpcensus[i].sch = S.sc.h; g_vpcensus[i].n = 0;
+    }
+    g_vpcensus[i].n++;
+}
+static void vpcensus_emit(void) {
+    for (int i = 0; i < g_vpcensus_n; i++) {
+        if (g_vpcensus[i].sc_set) VKLOG("viewport census @ present %llu: %ux%u depth=%d vp=(%d,%d,%d,%d) sc=(%d,%d,%d,%d): %llu draws", (unsigned long long)g_tex_frame, g_vpcensus[i].w, g_vpcensus[i].h, g_vpcensus[i].depth, g_vpcensus[i].vpx, g_vpcensus[i].vpy, g_vpcensus[i].vpw, g_vpcensus[i].vph, g_vpcensus[i].scx, g_vpcensus[i].scy, g_vpcensus[i].scw, g_vpcensus[i].sch, (unsigned long long)g_vpcensus[i].n);
+        else VKLOG("viewport census @ present %llu: %ux%u depth=%d vp=(%d,%d,%d,%d) sc=unset: %llu draws", (unsigned long long)g_tex_frame, g_vpcensus[i].w, g_vpcensus[i].h, g_vpcensus[i].depth, g_vpcensus[i].vpx, g_vpcensus[i].vpy, g_vpcensus[i].vpw, g_vpcensus[i].vph, (unsigned long long)g_vpcensus[i].n);
+    }
+    if (g_vpcensus_other) VKLOG("viewport census @ present %llu: other buckets: %llu draws", (unsigned long long)g_tex_frame, (unsigned long long)g_vpcensus_other);
+    g_vpcensus_n = 0; g_vpcensus_other = 0;
+}
+// Scissor census (DM_VK_SCISSOR_CENSUS=N, read live each submission in x_read): three views of the game's scissors, all keyed by present so menu
+// and race frames can be compared. (1) Per-draw distinct-scissor counts: every N presents, one line per distinct (render-target size, depth,
+// scissor) bucket with its draw count since the last census — many nested rects is a Slate clip stack, one rect for all draws is a global
+// scissor. (2) Per-pass lines (sccensus_pass, defined with the dump code below — it reads P_ca/P_da, declared after this block): for one frame every N presents (the frame whose present number is a multiple of N), every pass with draws logs
+// its index, render-target size, colour-target count, depth, load ops, last viewport and scissor bounding box (g_pass_bb, the bounding box of
+// the pass's draws' scissors, each intersected with its viewport in set_dynamic — the same quantity the menu rect {160,0,1440,720} was
+// identified as), flagging FULL-VP-BOXED-SC when the viewport is the full target but the scissor is not. (3) The guest caller of each distinct
+// scissor value is logged once at record time in hle_nvn.c (scissor_caller). Off when unset or 0; N=600 is a good first value. Counted on the
+// replay thread, single-threaded like the replay counters above.
+#define SCCENSUS_MAX 64
+static struct { uint32_t w, h; int depth; int32_t scx, scy, scw, sch; int sc_set; uint64_t draws; } g_sccensus[SCCENSUS_MAX];
+static int g_sccensus_n, g_x_sccensus; static uint64_t g_sccensus_next, g_sccensus_other;
+static void sccensus_draw(void) {
+    if (!g_x_sccensus) return;
+    int i = 0;
+    for (; i < g_sccensus_n; i++) {
+        if (g_sccensus[i].w == S.pass_w && g_sccensus[i].h == S.pass_h && g_sccensus[i].depth == (S.dfmt != 0) && g_sccensus[i].sc_set == S.sc_set &&
+            g_sccensus[i].scx == S.sc.x && g_sccensus[i].scy == S.sc.y && g_sccensus[i].scw == S.sc.w && g_sccensus[i].sch == S.sc.h) break;
+    }
+    if (i == g_sccensus_n) {
+        if (g_sccensus_n >= SCCENSUS_MAX) { g_sccensus_other++; return; }
+        g_sccensus_n++;
+        g_sccensus[i].w = S.pass_w; g_sccensus[i].h = S.pass_h; g_sccensus[i].depth = S.dfmt != 0; g_sccensus[i].sc_set = S.sc_set;
+        g_sccensus[i].scx = S.sc.x; g_sccensus[i].scy = S.sc.y; g_sccensus[i].scw = S.sc.w; g_sccensus[i].sch = S.sc.h; g_sccensus[i].draws = 0;
+    }
+    g_sccensus[i].draws++;
+}
+static void sccensus_emit(void) {
+    for (int i = 0; i < g_sccensus_n; i++) {
+        if (g_sccensus[i].sc_set) VKLOG("scissor: distinct @ present %llu: %ux%u depth=%d sc=(%d,%d,%d,%d): %llu draws", (unsigned long long)g_tex_frame, g_sccensus[i].w, g_sccensus[i].h, g_sccensus[i].depth, g_sccensus[i].scx, g_sccensus[i].scy, g_sccensus[i].scw, g_sccensus[i].sch, (unsigned long long)g_sccensus[i].draws);
+        else VKLOG("scissor: distinct @ present %llu: %ux%u depth=%d sc=unset: %llu draws", (unsigned long long)g_tex_frame, g_sccensus[i].w, g_sccensus[i].h, g_sccensus[i].depth, (unsigned long long)g_sccensus[i].draws);
+    }
+    if (g_sccensus_other) VKLOG("scissor: distinct @ present %llu: other buckets: %llu draws", (unsigned long long)g_tex_frame, (unsigned long long)g_sccensus_other);
+    g_sccensus_n = 0; g_sccensus_other = 0;
+}
 static inline uint64_t tnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 // The per-draw timers (about 10 a draw, ~3,000 draws a frame): the arm64 counter register read directly, a few ns against clock_gettime's ~20-40, in ns
 static inline uint64_t tick(void) {
@@ -95,6 +164,7 @@ static int g_lin_back = 1;   // DM_VK_LIN_BACK (see lin_back)
 static int g_samp_snap = 1;   // DM_NVN_SAMP_SNAP=0 (live): samplers as registered now, not as the bind saw them (gfx_vk_tex.c vk_samp_at)
 static uint64_t g_x_flat[8]; static int g_x_flat_mode[8], g_x_nflat;   // DM_VK_X_FLAT_VS=<vertex shader key>[:mode][,...] (debugging; pipelines made after it is set): mode bits 1 solid magenta pixel shader, 2 no depth test, 4 no blending (7 when left out)
 // Additional diagnostic bits: 8 no alpha coverage, 16 no depth bias, 32 no depth test/write, 64 no stencil. The mode is part of the pipeline key so live changes take effect.
+static int g_flatcolor, g_flatcolor_nodepth, g_flatcolor_seed;   // DM_VK_FLATCOLOR=1: every 3D draw gets one flat colour from a hash of its shader pair (windshield hunt); DM_VK_FLATCOLOR_NODEPTH=1: also no depth test/write; DM_VK_FLATCOLOR_SEED=N: shift the colour hash (a second session with another seed disambiguates the 16 colours)
 static uint64_t g_x_logfs;   // DM_VK_LOG_FS=<fragment shader key> (live): one line per draw with it, with its samplers as the draw sees them
 static int g_rd_touch = 1, g_x_rdkeep, g_x_nskipvs; static uint64_t g_x_skipvs[8];   // DM_VK_RD_TOUCH, DM_VK_X_RDKEEP, DM_VK_X_SKIPVS (see prepare_draw)
 static char g_x_tracesize[40], g_x_traceframe[40]; static int g_x_traceframe_on;
@@ -172,8 +242,14 @@ static void x_read(void) { const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws
     g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
     g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) : 1; if (g_lrz_touch == 1) g_lrz_touch = LRZ_ALL;   /* 0 none, 1 all, else LRZ_* bits */ g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
     g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 0; g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e); g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) && atoi(e);
-    g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_vbound = !((e = getenv("DM_VK_VBOUND")) && !atoi(e)); g_x_logfs = (e = getenv("DM_VK_LOG_FS")) ? strtoull(e, NULL, 16) : 0; g_x_nflat = 0; if ((e = getenv("DM_VK_X_FLAT_VS"))) for (char *q = (char *)e; *q && g_x_nflat < 8; ) { char *nx; uint64_t v = strtoull(q, &nx, 16); if (nx == q) break; int m = 7; if (*nx == ':') m = (int)strtol(nx + 1, &nx, 10); g_x_flat_mode[g_x_nflat] = m; g_x_flat[g_x_nflat++] = v; q = *nx ? nx + 1 : nx; } g_samp_snap = !((e = getenv("DM_NVN_SAMP_SNAP")) && !atoi(e)); g_lin_back = !((e = getenv("DM_VK_LIN_BACK")) && !atoi(e)); g_async_pipe = !((e = getenv("DM_VK_ASYNC_PIPE")) && !atoi(e)); g_prof_on = (e = getenv("DM_VK_PROF_SLOW")) && atoi(e); { extern volatile int g_vk_samp_log; if ((e = getenv("DM_VK_SAMP_LOG")) && atoi(e) > 0) { g_vk_samp_log = atoi(e); setenv("DM_VK_SAMP_LOG", "0", 1); } } g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
-    g_x_nskipvs = 0; for (const char *q = getenv("DM_VK_X_SKIPVS"); q && *q && g_x_nskipvs < 8;) { char *n; uint64_t v = strtoull(q, &n, 16); if (n == q) break; if (v) g_x_skipvs[g_x_nskipvs++] = v; q = *n ? n + 1 : n; } }
+    g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_vbound = !((e = getenv("DM_VK_VBOUND")) && !atoi(e)); g_x_logfs = (e = getenv("DM_VK_LOG_FS")) ? strtoull(e, NULL, 16) : 0; g_x_nflat = 0; if ((e = getenv("DM_VK_X_FLAT_VS"))) for (char *q = (char *)e; *q && g_x_nflat < 8; ) { char *nx; uint64_t v = strtoull(q, &nx, 16); if (nx == q) break; int m = 7; if (*nx == ':') m = (int)strtol(nx + 1, &nx, 10); g_x_flat_mode[g_x_nflat] = m; g_x_flat[g_x_nflat++] = v; q = *nx ? nx + 1 : nx; } g_flatcolor = (e = getenv("DM_VK_FLATCOLOR")) && atoi(e); g_flatcolor_nodepth = (e = getenv("DM_VK_FLATCOLOR_NODEPTH")) && atoi(e); g_flatcolor_seed = (e = getenv("DM_VK_FLATCOLOR_SEED")) ? atoi(e) : 0; g_samp_snap = !((e = getenv("DM_NVN_SAMP_SNAP")) && !atoi(e)); g_lin_back = !((e = getenv("DM_VK_LIN_BACK")) && !atoi(e)); g_async_pipe = !((e = getenv("DM_VK_ASYNC_PIPE")) && !atoi(e)); g_prof_on = (e = getenv("DM_VK_PROF_SLOW")) && atoi(e); { extern volatile int g_vk_samp_log; if ((e = getenv("DM_VK_SAMP_LOG")) && atoi(e) > 0) { g_vk_samp_log = atoi(e); setenv("DM_VK_SAMP_LOG", "0", 1); } } g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
+    g_x_nskipvs = 0; for (const char *q = getenv("DM_VK_X_SKIPVS"); q && *q && g_x_nskipvs < 8;) { char *n; uint64_t v = strtoull(q, &n, 16); if (n == q) break; if (v) g_x_skipvs[g_x_nskipvs++] = v; q = *n ? n + 1 : n; }
+    { static int last_n; int n = (e = getenv("DM_VK_VIEWPORT_CENSUS")) ? atoi(e) : 0;   // DM_VK_VIEWPORT_CENSUS=N: the viewport census every N presents (0 = off)
+      if (n != last_n) { last_n = n; g_x_vpcensus = n; g_vpcensus_next = n ? g_tex_frame + (uint64_t)n : 0; g_vpcensus_n = 0; g_vpcensus_other = 0; }
+      if (g_x_vpcensus && g_tex_frame >= g_vpcensus_next) { vpcensus_emit(); g_vpcensus_next = g_tex_frame + (uint64_t)g_x_vpcensus; } }
+    { static int last_n; int n = (e = getenv("DM_VK_SCISSOR_CENSUS")) ? atoi(e) : 0;   // DM_VK_SCISSOR_CENSUS=N: the scissor census every N presents (0 = off)
+      if (n != last_n) { last_n = n; g_x_sccensus = n; g_sccensus_next = n ? g_tex_frame + (uint64_t)n : 0; g_sccensus_n = 0; g_sccensus_other = 0; }
+      if (g_x_sccensus && g_tex_frame >= g_sccensus_next) { sccensus_emit(); g_sccensus_next = g_tex_frame + (uint64_t)g_x_sccensus; } } }
 // ---------------- conditional rendering (profile render_cond) ----------------
 // As nvn_mtl.m (OP_RENDER_COND): SetRenderEnableConditional draws while the 64-bit counters of the reports at addr and addr + 16 are equal / differ, until SetRenderEnable(true).
 // Evaluated on the CPU at replay from the records in memory: a report replayed earlier in this submission is not written yet (that happens when the GPU completes), so a timestamp
@@ -520,6 +596,96 @@ void vk_pass_dump_poll(uint64_t done_fence) {   // gfx_vk_present.c, every prese
     }
     g_npd = 0; g_pd_state = 0;
 }
+// DM_DUMP_PRESENT=1: three readback dumps of one frame, to place the black bars — the end of the scene pass, the end of the UI pass, and the
+// presented texture before present (gfx_vk_present.c). The target is the first present after 30 (vk_dump_arm, from mtl_present): the scene
+// and UI copies are recorded during that frame's submissions, while g_tex_frame + 1 is the target. The scene pass is the frame's first pass
+// with three or more colour targets (a G-buffer); the fallback is the first pass with depth (a forward renderer has no multi-target pass).
+// The UI pass is the frame's last pass into the acquired window texture (dm_is_win_tex, hle_nvn.c) — the composite and the UI may both draw
+// there, so every such pass is copied and only the last is written. Files are DM_ROOT/dump_<present>_scene.ppm, _ui.ppm and _prepresent.ppm,
+// proper RGB P6 like the pass dump's. The copies reuse the pass dump's staging-buffer copy, so no new GPU readback path is invented.
+static uint64_t g_dump_target;   // the present being dumped (0 = not armed); written by the present thread, read by the replay thread
+static pdump_t g_dump_scene, g_dump_scenefb; static pdump_t g_dump_ui[8]; static int g_dump_ui_n, g_dump_scene_set, g_dump_scenefb_set, g_dump_scene_seen, g_dump_scene_written, g_dump_ui_written, g_dump_reported;
+void vk_dump_arm(uint64_t n) {
+    if (g_dump_target) return;
+    const char *e = getenv("DM_DUMP_PRESENT"); if (!e || !atoi(e) || n < 30) return;
+    g_dump_target = n + 1;
+}
+uint64_t vk_dump_target(void) { return g_dump_target; }
+static int dump_copy(pdump_t *d, const tex_t *t, const view_t *cv) {   // the pass dump's copy, for one texture: 1 if the copy was recorded
+    vkimg_t *im = vk_tex(t);
+    if (!im || (im->fmt != VK_FORMAT_R8G8B8A8_UNORM && im->fmt != VK_FORMAT_R8G8B8A8_SRGB && im->fmt != VK_FORMAT_R16G16B16A16_SFLOAT && im->fmt != VK_FORMAT_B8G8R8A8_UNORM &&
+                                                        im->fmt != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && im->fmt != VK_FORMAT_R16_SFLOAT && im->fmt != VK_FORMAT_R8_UNORM && im->fmt != VK_FORMAT_A2B10G10R10_UNORM_PACK32)) return 0;
+    uint32_t lv = cv && cv->set_levels ? cv->base_level : 0, ly = cv && cv->set_layers ? cv->min_layer : 0, w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1;
+    if (lv >= im->levels || ly >= im->layers) lv = ly = 0, w = im->w, h = im->h;
+    uint32_t bpp = im->fmt == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : im->fmt == VK_FORMAT_R16_SFLOAT ? 2 : im->fmt == VK_FORMAT_R8_UNORM ? 1 : 4; VkDeviceSize n = (VkDeviceSize)w * h * bpp;
+    *d = (pdump_t){0, 0, 0, w, h, im->fmt, mtl_last_fence() + 1, g_sub_pass - 1, g_tex_frame + 1};
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, n, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+    VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &d->b)); VkMemoryRequirements rq; vkGetBufferMemoryRequirements(V.dev, d->b, &rq);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, rq.size, vk_mem_type(rq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0)};
+    VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &d->m)); VKCHK(vkBindBufferMemory(V.dev, d->b, d->m, 0)); VKCHK(vkMapMemory(V.dev, d->m, 0, VK_WHOLE_SIZE, 0, &d->p));
+    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
+    VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, d->b, 1, &c); vk_img_barrier_all(cb);
+    return 1;
+}
+static void sccensus_pass(void) {   // one line per pass of a sample frame (vk_end_pass): the pass's draws and scissor box are final here
+    if (!g_x_sccensus || !g_pass_draws || (g_tex_frame + 1) % (uint64_t)g_x_sccensus) return;
+    int boxed = g_pass_bb[0] != 0 || g_pass_bb[1] != 0 || g_pass_bb[2] != (int32_t)S.pass_w || g_pass_bb[3] != (int32_t)S.pass_h;
+    int fullvp = S.vp[0][0] == 0 && S.vp[0][1] == 0 && S.vp[0][2] == (float)S.pass_w && S.vp[0][3] == (float)S.pass_h;
+    VKLOG("scissor: present %llu pass %d: %ux%u ncol=%d depth=%d load=%d/%d vp=(%.0f,%.0f,%.0f,%.0f) sc-bb=(%d,%d,%d,%d) draws=%llu%s", (unsigned long long)(g_tex_frame + 1), g_sub_pass - 1, S.pass_w, S.pass_h, S.ncol, S.dfmt != 0, S.ncol ? (int)P_ca[0].loadOp : -1, S.dfmt ? (int)P_da.loadOp : -1, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], g_pass_bb[0], g_pass_bb[1], g_pass_bb[2], g_pass_bb[3], (unsigned long long)g_pass_draws, fullvp && boxed ? " FULL-VP-BOXED-SC" : "");
+}
+static void dump_pass(void) {   // at a pass's end (vk_end_pass): record the scene / UI copies of the target frame, if this is one of its passes
+    if (!g_dump_target || g_tex_frame + 1 != g_dump_target || !g_pass_draws || !S.ncol) return;
+    int dm_is_win_tex(const tex_t *t);
+    int ci = 0; while (ci < S.ncol && ci < 8 && !S.rt_has_col[ci]) ci++;
+    if (ci >= S.ncol || ci >= 8) return;
+    const view_t *cv = S.rt_has_cview[ci] ? &S.rt_cview[ci] : NULL;
+    if (S.ncol >= 3 && !g_dump_scene_set) { if (dump_copy(&g_dump_scene, &S.rt_col[ci], cv)) { g_dump_scene_set = 1; g_dump_scene_seen = 1; } }
+    if (S.dfmt && !g_dump_scenefb_set) g_dump_scenefb_set = dump_copy(&g_dump_scenefb, &S.rt_col[ci], cv);
+    if (dm_is_win_tex(&S.rt_col[ci])) {
+        if (g_dump_ui_n < 8) { if (dump_copy(&g_dump_ui[g_dump_ui_n], &S.rt_col[ci], cv)) g_dump_ui_n++; }
+        else { static int warned; if (!warned++) VKLOG("dump: present %llu: more than 8 passes into the window texture, keeping the first 8", (unsigned long long)g_dump_target); }
+    }
+}
+static void dump_write_file(pdump_t *d, const char *path, const char *what) {   // the slot as a proper RGB P6 (the pass dump's conversion, colour only)
+    FILE *f = fopen(path, "wb"); if (!f) { VKLOG("[RED] dump: cannot write %s", path); return; }
+    fprintf(f, "P6\n%u %u\n255\n", d->w, d->h);
+    uint8_t *row = malloc((size_t)d->w * 3);
+    for (uint32_t y = 0; y < d->h; y++) { for (uint32_t x = 0; x < d->w; x++) {
+        if (d->f == VK_FORMAT_R16G16B16A16_SFLOAT || d->f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || d->f == VK_FORMAT_R16_SFLOAT) { float v3[3];
+            if (d->f == VK_FORMAT_R16G16B16A16_SFLOAT) { const uint16_t *p = (const uint16_t *)d->p + ((size_t)y * d->w + x) * 4; for (int c = 0; c < 3; c++) v3[c] = half2f(p[c]); }
+            else if (d->f == VK_FORMAT_R16_SFLOAT) v3[0] = v3[1] = v3[2] = half2f(((const uint16_t *)d->p)[(size_t)y * d->w + x]);
+            else { uint32_t w = ((const uint32_t *)d->p)[(size_t)y * d->w + x];
+                v3[0] = half2f((uint16_t)((w & 0x7ff) << 4)); v3[1] = half2f((uint16_t)((w >> 11 & 0x7ff) << 4)); v3[2] = half2f((uint16_t)((w >> 22 & 0x3ff) << 5)); }
+            for (int c = 0; c < 3; c++) { float v = v3[c]; row[3 * x + c] = (uint8_t)(v != v || v >= 1 ? 255 : v <= 0 ? 0 : v * 255 + .5f); } }
+        else if (d->f == VK_FORMAT_R8_UNORM) row[3 * x] = row[3 * x + 1] = row[3 * x + 2] = ((const uint8_t *)d->p)[(size_t)y * d->w + x];
+        else if (d->f == VK_FORMAT_A2B10G10R10_UNORM_PACK32) { uint32_t w = ((const uint32_t *)d->p)[(size_t)y * d->w + x]; for (int c = 0; c < 3; c++) row[3 * x + c] = (uint8_t)((w >> (10 * c) & 0x3ff) >> 2); }
+        else { const uint8_t *p = (const uint8_t *)d->p + ((size_t)y * d->w + x) * 4; int bgr = d->f == VK_FORMAT_B8G8R8A8_UNORM; row[3 * x] = p[bgr ? 2 : 0]; row[3 * x + 1] = p[1]; row[3 * x + 2] = p[bgr ? 0 : 2]; } }
+        fwrite(row, 1, (size_t)d->w * 3, f); }
+    free(row); fclose(f);
+    VKLOG("dump: present %llu %s pass %d %ux%u format %d -> %s", (unsigned long long)d->present, what, d->pass, d->w, d->h, d->f, path);
+}
+static void dump_free(pdump_t *d) { if (d->b) { vkDestroyBuffer(V.dev, d->b, NULL); vkFreeMemory(V.dev, d->m, NULL); d->b = VK_NULL_HANDLE; } }
+void vk_dump_present_poll(uint64_t done_fence) {   // gfx_vk_present.c, every present: write the target frame's dumps once the GPU finished them
+    if (!g_dump_target) return;
+    const char *root = getenv("DM_ROOT"); if (!root) root = ".";
+    if (g_dump_scene_set && g_dump_scene.b && done_fence >= g_dump_scene.fence) { char path[1024]; snprintf(path, sizeof path, "%s/dump_%llu_scene.ppm", root, (unsigned long long)g_dump_target); dump_write_file(&g_dump_scene, path, "scene"); dump_free(&g_dump_scene); g_dump_scene_set = 0; g_dump_scene_written = 1; }
+    if (g_dump_scenefb_set && g_dump_scenefb.b && done_fence >= g_dump_scenefb.fence) {   // the fallback is freed on its own fence: it may sit in a later submission than the primary
+        if (!g_dump_scene_seen) { char path[1024]; snprintf(path, sizeof path, "%s/dump_%llu_scene.ppm", root, (unsigned long long)g_dump_target); dump_write_file(&g_dump_scenefb, path, "scene (fallback: first depth pass)"); g_dump_scene_written = 1; }
+        dump_free(&g_dump_scenefb); g_dump_scenefb_set = 0; }
+    if (g_dump_ui_n && g_dump_ui[g_dump_ui_n - 1].b && done_fence >= g_dump_ui[g_dump_ui_n - 1].fence) {
+        for (int i = 0; i < g_dump_ui_n - 1; i++) dump_free(&g_dump_ui[i]);   // earlier passes into the window texture (the composite): only the last is written
+        char path[1024]; snprintf(path, sizeof path, "%s/dump_%llu_ui.ppm", root, (unsigned long long)g_dump_target);
+        dump_write_file(&g_dump_ui[g_dump_ui_n - 1], path, "ui"); dump_free(&g_dump_ui[g_dump_ui_n - 1]);
+        if (g_dump_ui_n > 1) VKLOG("dump: present %llu: %d passes drew into the window texture, the last (pass %d) is the UI dump", (unsigned long long)g_dump_target, g_dump_ui_n, g_dump_ui[g_dump_ui_n - 1].pass);
+        g_dump_ui_n = 0; g_dump_ui_written = 1;
+    }
+    if (g_tex_frame >= g_dump_target && !g_dump_reported) {   // the target present has passed: say plainly which dumps never materialised
+        g_dump_reported = 1;
+        if (!g_dump_scene_set && !g_dump_scenefb_set && !g_dump_scene_written) VKLOG("dump: present %llu: no scene pass found (no pass with 3+ colour targets or depth)", (unsigned long long)g_dump_target);
+        if (!g_dump_ui_n && !g_dump_ui_written) VKLOG("dump: present %llu: no pass drew into the window texture", (unsigned long long)g_dump_target);
+    }
+}
 // DM_VK_CRUMBS=1 (start-up), for a device lost (a GPU hang): every pass end and dispatch writes {submission, pass} into host-visible memory after a full barrier, and the host
 // keeps the shaders each pass drew with; when the device is lost (vk_crumbs_report), the last work the GPU finished and the passes after it are logged
 static int g_crumbs = -1; static VkBuffer g_crumb_buf; static volatile uint32_t *g_crumb;
@@ -612,6 +778,8 @@ void vk_end_pass(void) {
     if (S.pass_open == 1) { if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); bc_draw_back(); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
+    if (S.pass_open == 1) sccensus_pass();   // the pass's scissor bounding box is final here (g_pass_bb is reset at the next begin_pass)
+    if (S.pass_open == 1) dump_pass();   // DM_DUMP_PRESENT: the target frame's scene and UI passes leave a copy behind (written by vk_dump_present_poll)
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
 }
 // a pass end before something that reads or writes pool memory other than through a uniform binding (copies, fills, dispatches, buffer ↔ texture
@@ -732,6 +900,22 @@ static VkRect2D scissor_rect(void) {
 #include "maskclear_vert.spv.h"
 #include "maskclear_frag.spv.h"
 #include "flatdbg_frag.spv.h"
+#include "flatcolor00_frag.spv.h"
+#include "flatcolor01_frag.spv.h"
+#include "flatcolor02_frag.spv.h"
+#include "flatcolor03_frag.spv.h"
+#include "flatcolor04_frag.spv.h"
+#include "flatcolor05_frag.spv.h"
+#include "flatcolor06_frag.spv.h"
+#include "flatcolor07_frag.spv.h"
+#include "flatcolor08_frag.spv.h"
+#include "flatcolor09_frag.spv.h"
+#include "flatcolor10_frag.spv.h"
+#include "flatcolor11_frag.spv.h"
+#include "flatcolor12_frag.spv.h"
+#include "flatcolor13_frag.spv.h"
+#include "flatcolor14_frag.spv.h"
+#include "flatcolor15_frag.spv.h"
 typedef struct { uint32_t ncol, cfmt[8], dfmt, samples, mask; } mckey;
 static struct { VkPipelineLayout pl; VkShaderModule vs, fs; int bad; mckey k[32]; VkPipeline p[32]; int n; } g_mc;
 static VkPipeline mc_pipeline(uint32_t mask) {
@@ -1081,6 +1265,27 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
         static VkShaderModule fm; if (!fm) { VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof flatdbg_frag_spv, flatdbg_frag_spv}; VKCHK(vkCreateShaderModule(V.dev, &mi, NULL, &fm)); }
         for (uint32_t i = 0; i < ns; i++) if (ss[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) ss[i].module = fm;
     }
+    // DM_VK_FLATCOLOR applies only to pipelines with a depth attachment (the 3D scene);
+    // UI/menu pipelines (no depth) keep their real shaders so the game stays navigable.
+    int fc = g_flatcolor && k->dfmt != VK_FORMAT_UNDEFINED;
+    if (fc && fs) {   // DM_VK_FLATCOLOR: the 3D draw's fragment stage becomes one of 16 baked-colour flatcolor variants
+        // One colour per shader pair, picked at pipeline build time by hash (v1's
+        // per-draw push constant never varied: the whole screen came out one colour).
+        // Same pair = same pipeline = same colour every frame. The seed shifts the
+        // hash so a second session disambiguates the 16 colours. The colour is baked
+        // into the variant: NO specialization constant, NO push constant — both
+        // crashed Turnip's shader compiler during prewarm (v3 spec constant + array,
+        // v4 spec constant + if/else chain, both in the FIRST graphics pipeline).
+        // Modules are created lazily per colour, like flatdbg's single module above
+        // (a prewarm race only leaks a duplicate module, as there).
+        static VkShaderModule cm[16];
+        static const uint32_t *fc_spv[16] = {flatcolor00_frag_spv, flatcolor01_frag_spv, flatcolor02_frag_spv, flatcolor03_frag_spv, flatcolor04_frag_spv, flatcolor05_frag_spv, flatcolor06_frag_spv, flatcolor07_frag_spv, flatcolor08_frag_spv, flatcolor09_frag_spv, flatcolor10_frag_spv, flatcolor11_frag_spv, flatcolor12_frag_spv, flatcolor13_frag_spv, flatcolor14_frag_spv, flatcolor15_frag_spv};
+        static const size_t fc_spv_sz[16] = {sizeof flatcolor00_frag_spv, sizeof flatcolor01_frag_spv, sizeof flatcolor02_frag_spv, sizeof flatcolor03_frag_spv, sizeof flatcolor04_frag_spv, sizeof flatcolor05_frag_spv, sizeof flatcolor06_frag_spv, sizeof flatcolor07_frag_spv, sizeof flatcolor08_frag_spv, sizeof flatcolor09_frag_spv, sizeof flatcolor10_frag_spv, sizeof flatcolor11_frag_spv, sizeof flatcolor12_frag_spv, sizeof flatcolor13_frag_spv, sizeof flatcolor14_frag_spv, sizeof flatcolor15_frag_spv};
+        uint64_t h = (stg[0] ? stg[0]->key : 0) * 0x9e3779b97f4a7c15ull ^ fs->key * 0xbf58476d1ce4e5b9ull; h ^= (uint64_t)g_flatcolor_seed * 0x94d049bb133111ebull; h ^= h >> 29; h *= 0x94d049bb133111ebull; h ^= h >> 32;
+        int ci = (int)(h % 16);
+        if (!cm[ci]) { VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, fc_spv_sz[ci], fc_spv[ci]}; VKCHK(vkCreateShaderModule(V.dev, &mi, NULL, &cm[ci])); }
+        for (uint32_t i = 0; i < ns; i++) if (ss[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) ss[i].module = cm[ci];   // the stage's specialization info stays NULL (set in the ss[] initializer above)
+    }
     if (flat) { static int n; if (n++ < 12) VKLOG("debugging: vertex shader %016llx with fragment %016llx: mode %d (1 magenta, 2 no depth test, 4 no blending); %u colour targets, blending %#x (target 0: src %u dst %u op %u, alpha src %u dst %u op %u, write mask %#x), depth test %u write %u func %u",
         (unsigned long long)stg[0]->key, (unsigned long long)fs->key, flat, k->ncol, k->blend_en, k->bl[0].src, k->bl[0].dst, k->bl[0].eq, k->bl[0].srca, k->bl[0].dsta, k->bl[0].eqa, k->wmask[0], k->dt, k->dw, k->df); }
     VkVertexInputAttributeDescription ad[16]; VkVertexInputBindingDescription bd[17]; VkVertexInputBindingDivisorDescriptionEXT dd[17]; uint32_t ndd = 0;
@@ -1103,10 +1308,12 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     if (flat & 2) { ds.depthTestEnable = ds.depthWriteEnable = ds.stencilTestEnable = 0; }
     if (flat & 32) ds.depthTestEnable = ds.depthWriteEnable = 0;
     if (flat & 64) ds.stencilTestEnable = 0;
+    if (g_flatcolor_nodepth && fc) { ds.depthTestEnable = ds.depthWriteEnable = 0; }
     VkPipelineColorBlendAttachmentState cba[8];
     for (uint32_t i = 0; i < k->ncol; i++) cba[i] = (VkPipelineColorBlendAttachmentState){(k->blend_en >> i) & 1, bfac(k->bl[i].src), bfac(k->bl[i].dst), bop(k->bl[i].eq),
         bfac(k->bl[i].srca), bfac(k->bl[i].dsta), bop(k->bl[i].eqa), k->wmask[i]};
     if (flat & 4) for (uint32_t i = 0; i < k->ncol; i++) { cba[i].blendEnable = 0; cba[i].colorWriteMask = 0xf; }
+    if (fc) for (uint32_t i = 0; i < k->ncol; i++) { cba[i].blendEnable = 0; cba[i].colorWriteMask = 0xf; }
     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, k->logic_en, (VkLogicOp)k->logic_op, k->ncol, cba, {0, 0, 0, 0}};
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
                             VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_LINE_WIDTH};
@@ -2020,8 +2227,39 @@ static void draw(const p_draw *d) {
     // before prepare_draw, whose driver segment carries it (c0 + 0x644): set after it, each draw's segment had the draw before's. An indirect draw's is in GPU memory: 0
     g_draw_binst = d->ind ? 0 : (uint32_t)d->base_instance;
     if (!prepare_draw(prim == 7 ? 4 : prim, prim == 7)) return;
+    // Blend-draw hook (Claude windscreen step 1 fallback): draws with blending enabled and a
+    // small index count are candidates for the windshield/visor glass (small, transparent,
+    // blended). Logs present, pass, shader keys, index count, blend, write mask, depth, cull.
+    // Run DM_VK_LOG_FS=<fs key> on a candidate to list its samplers, and DM_VK_X_FLAT_VS=<vs
+    // key> (mode 1 magenta, 2 no depth, 4 no blend) for the magenta triage test.
+    if (S.color.blend_en && !d->ind && (uint32_t)d->count < 3000 && S.sh[0] && S.sh[1]) {
+        static int bd; if (bd++ < 100) VKLOG("blenddraw: present %llu pass %d vs %016llx fs %016llx idx %u blend_en %#x bl0 src %u dst %u eq %u sa %u da %u eqa %u wmask %#x depth t%u w%u f%u cull %u",
+            (unsigned long long)g_tex_frame, g_sub_pass - 1,
+            (unsigned long long)S.sh[0]->key, (unsigned long long)S.sh[1]->key,
+            (unsigned)d->count, S.color.blend_en,
+            S.blend[0].src_rgb, S.blend[0].dst_rgb, S.blend[0].eq_rgb,
+            S.blend[0].src_a, S.blend[0].dst_a, S.blend[0].eq_a,
+            (S.chmask.mask >> 0) & 0xf, S.ds.dt, S.ds.dw, S.ds.df, S.poly.cull);
+    }
+    // Flatcolor first-draw log: one line per pipeline, on its first draw (prewarm builds
+    // ~28k pipelines before the game draws, so logging in build_pipeline would burn the
+    // cap). Only 3D draws (S.rt_has_dep) are flatcoloured; UI/menu pipelines are not.
+    // The colour index is recomputed with the same hash build_pipeline used (seed
+    // included): ci is the baked variant the pipeline got, color its name.
+    if (g_flatcolor && S.rt_has_dep && S.sh[0] && S.sh[1] && S.bound_pipe) {
+        static VkPipeline seen[4096]; static int seen_n;
+        int dup = 0; for (int i = 0; i < seen_n; i++) if (seen[i] == S.bound_pipe) { dup = 1; break; }
+        if (!dup && seen_n < 4096) { seen[seen_n++] = S.bound_pipe;
+            static const char *pn[16] = {"red","green","blue","yellow","cyan","magenta","orange","purple","lime","pink","teal","brown","white","gray","navy","olive"};
+            uint64_t h = S.sh[0]->key * 0x9e3779b97f4a7c15ull ^ S.sh[1]->key * 0xbf58476d1ce4e5b9ull; h ^= (uint64_t)g_flatcolor_seed * 0x94d049bb133111ebull; h ^= h >> 29; h *= 0x94d049bb133111ebull; h ^= h >> 32;
+            VKLOG("flatcolor: seed %d present %llu pass %d vs %016llx fs %016llx ci %u color %s blend_en %#x depth t%u w%u f%u cull %u",
+                g_flatcolor_seed, (unsigned long long)g_tex_frame, g_sub_pass - 1,
+                (unsigned long long)S.sh[0]->key, (unsigned long long)S.sh[1]->key,
+                (unsigned)(h % 16), pn[h % 16], S.color.blend_en, S.ds.dt, S.ds.dw, S.ds.df, S.poly.cull); }
+    }
     VkCommandBuffer cb = vk_cmd();
     int g_ok = draw_allowed(); if (g_ok == 2 || (g_tracing && g_x_tracepass >= 0)) trace_draw("draw", d->prim, (uint32_t)d->count, (uint32_t)d->instances, -1);
+    vpcensus_count(); sccensus_draw();
     if (g_tracing && g_x_tracepass >= 0 && !d->ind && S.vbuf[0].address) {   // the first vertices stream 0 gives the draw (with the deferred updates), every word as a float
         uint32_t st = S.vstream[0].stride ? S.vstream[0].stride : 16, nw = st / 4 < 16 ? st / 4 : 16;
         for (uint32_t v = 0; v < (uint32_t)d->count && v < 4; v++) { uint64_t o = (uint64_t)((uint32_t)d->first + v) * st; if (o + nw * 4 > S.vbuf[0].size) break;
@@ -2066,6 +2304,7 @@ static void draw_idx(const p_draw_idx *d) {
     if (!prepare_draw(prim == 7 ? 4 : prim, 1)) return;
     VkCommandBuffer cb = vk_cmd();
     int g_ok = draw_allowed(); if (g_ok == 2 || (g_tracing && g_x_tracepass >= 0)) trace_draw("indexed draw", d->prim, (uint32_t)d->count, (uint32_t)d->instances, d->itype);
+    vpcensus_count(); sccensus_draw();
     if (d->ind && g_tracing && g_x_tracepass >= 0) { uint32_t w[5]; vk_ubd_read(d->ind, 20, (uint8_t *)w);   // the arguments as the CPU sees them now (a GPU writer's last merged copy)
         VKLOG("  indirect arguments at %#llx: count %u instances %u first index %u base vertex %d base instance %u", (unsigned long long)d->ind, w[0], w[1], w[2], (int)w[3], w[4]); }
     if (g_tracing && g_x_tracepass >= 0 && !d->ind && S.vbuf[0].address && d->ibuf) {   // the vertices of the first indices, stream 0, every word as a float (as draw does)
@@ -2223,6 +2462,13 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
     vk_end_pass_land();
     vkimg_t *im = vk_tex(c->tex); const vkfmt_t *f = vk_fmt(c->tex->d.format);
     if (!im || !f) return;
+    // Copy log (Claude step 2, point 1): every buffer→texture copy targeting a 2048 rider/bike
+    // texture (fmt 0x9a/0x44). Hypothesis: 2048s are filled by GPU copies, not CPU writes.
+    if (to_texture && c->tex->d.width == 2048 && c->tex->d.height == 2048 && (c->tex->d.format == 0x9a || c->tex->d.format == 0x44)) {
+        static int cb2; if (cb2++ < 200) VKLOG("copy_b2t: present %llu dst serial %llu fmt %#x region %dx%d@%d,%d mip %u layer %u (attempt)",
+            (unsigned long long)g_tex_frame, (unsigned long long)c->tex->serial, c->tex->d.format, c->r.width, c->r.height ? c->r.height : 1, c->r.xoffset, c->r.yoffset,
+            (unsigned)sub_of(im, &c->view, c->has_view, c->r.zoffset).mipLevel, (unsigned)sub_of(im, &c->view, c->has_view, c->r.zoffset).baseArrayLayer);
+    }
     VkBuffer b; VkDeviceSize o;
     if (!vk_buf_at(c->src, 1, &b, &o)) { VKRED_ONCE(70, "buffer of a buffer ↔ texture copy outside the memory pools"); return; }
     VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb);
@@ -2242,7 +2488,10 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
         b = sb; r.bufferOffset = so; r.bufferRowLength = 0; r.bufferImageHeight = 0;
     }
     if (g_watch_off >= 0) { char w[96]; snprintf(w, sizeof w, "buffer copy %s (buffer %#llx, %dx%d)", to_texture ? "destination" : "source", (unsigned long long)c->src, c->r.width, c->r.height); vk_watch(im, w); }
-    if (to_texture) { vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r); im->gpu_w = 1; }
+    if (to_texture) { vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r); im->gpu_w = 1;
+        if (c->tex->d.width == 2048 && c->tex->d.height == 2048 && (c->tex->d.format == 0x9a || c->tex->d.format == 0x44)) {
+            static int cb2e; if (cb2e++ < 200) VKLOG("copy_b2t: present %llu dst serial %llu fmt %#x region %dx%d mip %u EXECUTED",
+                (unsigned long long)g_tex_frame, (unsigned long long)c->tex->serial, c->tex->d.format, c->r.width, c->r.height ? c->r.height : 1, (unsigned)r.imageSubresource.mipLevel); } }
     else { vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &r);
         void vk_gpu_wrote(uint64_t a, uint64_t n); vkpool_t *p = vk_pool_of(c->src, 1); vk_gpu_wrote(c->src, p ? p->hi - c->src : 1); vk_readback_unknown(); }   // (to the pool's end: the copy's extent in memory is not worked out here)
     vk_img_barrier_all(cb);
@@ -2309,10 +2558,59 @@ static int depth_scale(VkCommandBuffer cb, vkimg_t *s, vkimg_t *d, VkImageSubres
     return 1;
 }
 enum { CF_MIRROR_X = 4, CF_MIRROR_Y = 8 };   // NVNcopyFlags (copy_t2t)
+// A blit into a block-compressed image has no Vulkan path (a BC format never
+// supports BLIT_DST), so the copy was skipped and the destination stayed black.
+// MotoGP 18 fills its reflection probes (BC3) by blitting from a 128-bit render
+// target, and with the probe black every glossy surface in a dark scene (the
+// grid bike, the rider's leathers) renders black. There is no BC encoder on the
+// host, so the fallback fills the destination region with one flat BC block (a
+// dark grey), which lights those surfaces dimly instead of leaving them black.
+// The colour is a placeholder until a real BC blit exists; the log line names
+// the destination so the fill is visible. Returns 0 where it does not apply
+// (a format without a flat block, or a region that is not block-aligned).
+static int bc_flat_fill(VkCommandBuffer cb, vkimg_t *d, const VkImageSubresourceLayers *ds, const p_copy_t2t *k) {
+    // BC3 (and BC3 sRGB): 16 bytes a 4x4 block. Alpha: min=max=255, all indices 0.
+    // Colour: min=max=RGB565(48,48,48)=0x3186, all indices 0.
+    static const uint8_t bc3[16] = {0xFF,0xFF,0,0,0,0,0,0, 0x86,0x31,0x86,0x31,0,0,0,0};
+    // BC1: 8 bytes a block. Colour only, same endpoints/indices.
+    static const uint8_t bc1[8] = {0x86,0x31,0x86,0x31,0,0,0,0};
+    // BC2: 16 bytes. Alpha: 4-bit explicit, all 0xF (opaque). Colour: as BC1.
+    static const uint8_t bc2[16] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, 0x86,0x31,0x86,0x31,0,0,0,0};
+    // BC4: 8 bytes, one channel. Endpoints 0x80 (mid), indices 0.
+    static const uint8_t bc4[8] = {0x80,0x80,0,0,0,0,0,0};
+    // BC5: 16 bytes, two BC4 blocks (R and G).
+    static const uint8_t bc5[16] = {0x80,0x80,0,0,0,0,0,0, 0x80,0x80,0,0,0,0,0,0};
+    const uint8_t *blk; size_t blen;
+    if (d->fmt == VK_FORMAT_BC3_UNORM_BLOCK || d->fmt == VK_FORMAT_BC3_SRGB_BLOCK) { blk = bc3; blen = 16; }
+    else if (d->fmt == VK_FORMAT_BC1_RGB_UNORM_BLOCK || d->fmt == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ||
+             d->fmt == VK_FORMAT_BC1_RGB_SRGB_BLOCK || d->fmt == VK_FORMAT_BC1_RGBA_SRGB_BLOCK) { blk = bc1; blen = 8; }
+    else if (d->fmt == VK_FORMAT_BC2_UNORM_BLOCK || d->fmt == VK_FORMAT_BC2_SRGB_BLOCK) { blk = bc2; blen = 16; }
+    else if (d->fmt == VK_FORMAT_BC4_UNORM_BLOCK) { blk = bc4; blen = 8; }
+    else if (d->fmt == VK_FORMAT_BC5_UNORM_BLOCK) { blk = bc5; blen = 16; }
+    else { static int nr; if (nr++ < 20) VKLOG("bc_flat_fill: format %d not handled (%dx%d, present %llu)", d->fmt, k->dr.width, k->dr.height, (unsigned long long)g_tex_frame); return 0; }
+    int32_t xo = k->dr.xoffset, yo = k->dr.yoffset, dw = k->dr.width, dh = k->dr.height;
+    if ((xo & 3) || (yo & 3) || (dw & 3) || (dh & 3) || dw <= 0 || dh <= 0) { static int na; if (na++ < 20) VKLOG("bc_flat_fill: region not block-aligned (fmt %d, @%d,%d %dx%d, present %llu)", d->fmt, xo, yo, dw, dh, (unsigned long long)g_tex_frame); return 0; }
+    uint32_t bx = (uint32_t)(dw / 4), by = (uint32_t)(dh / 4);
+    size_t n = (size_t)bx * by * blen;
+    VkBuffer sb; VkDeviceSize so; uint8_t *p = vk_scratch(n, 16, &sb, &so);
+    if (!p) return 0;
+    for (size_t i = 0; i < n; i += blen) memcpy(p + i, blk, blen);
+    VkBufferImageCopy r = {so, 0, 0, *ds, {xo, yo, 0}, {(uint32_t)dw, (uint32_t)dh, 1}};
+    vkCmdCopyBufferToImage(cb, sb, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    return 1;
+}
 static void copy_t2t(const p_copy_t2t *c) {
     vk_end_pass();
     vkimg_t *s = vk_tex(c->src), *d = vk_tex(c->dst);
     if (!s || !d) return;
+    // Copy log (Claude step 2, point 1): every texture→texture copy targeting a 2048 rider/bike
+    // texture (fmt 0x9a/0x44). An attempt with no matching EXECUTED line was skipped (see the
+    // VKRED_ONCE 72/73/74/75 lines for why: outside images, clipped, unblittable formats).
+    if (c->dst->d.width == 2048 && c->dst->d.height == 2048 && (c->dst->d.format == 0x9a || c->dst->d.format == 0x44)) {
+        static int ct2; if (ct2++ < 200) VKLOG("copy_t2t: present %llu dst serial %llu fmt %#x src serial %llu region %dx%d@%d,%d -> %dx%d@%d,%d flags %#x (attempt)",
+            (unsigned long long)g_tex_frame, (unsigned long long)c->dst->serial, c->dst->d.format, (unsigned long long)c->src->serial,
+            c->sr.width, c->sr.height ? c->sr.height : 1, c->sr.xoffset, c->sr.yoffset, c->dr.width, c->dr.height ? c->dr.height : 1, c->dr.xoffset, c->dr.yoffset, c->flags);
+    }
     vk_watch(s, "copy source"); vk_watch(d, "copy destination");
     VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, s); vk_tex_prepare(cb, d); vk_img_barrier_all(cb);
     VkImageSubresourceLayers ss = sub_of(s, &c->sv, c->has_sv, c->sr.zoffset), ds = sub_of(d, &c->dv, c->has_dv, c->dr.zoffset);
@@ -2320,7 +2618,21 @@ static void copy_t2t(const p_copy_t2t *c) {
     // to both images' levels, a copy with nothing left is skipped
     int32_t sw = (int32_t)(s->w >> ss.mipLevel ? s->w >> ss.mipLevel : 1), sh = (int32_t)(s->h >> ss.mipLevel ? s->h >> ss.mipLevel : 1);
     int32_t dw = (int32_t)(d->w >> ds.mipLevel ? d->w >> ds.mipLevel : 1), dh = (int32_t)(d->h >> ds.mipLevel ? d->h >> ds.mipLevel : 1);
-    p_copy_t2t k = *c; c = &k; d->gpu_w = 1;
+    p_copy_t2t k = *c; c = &k;
+    // Size-compatible copy (MotoGP 18, Claude step 2): the game encodes BC3 on the GPU into an
+    // RGBA32UI render target at 1/4 resolution (512x512 RGBA32UI = 2048x2048 BC3, both 4 MB),
+    // then copies it over. RGBA32UI is 16 bytes/texel, BC3 is 16 bytes/4x4 block: same block
+    // byte size, so vkCmdCopyImage is legal between them (extent in source texels = blocks,
+    // the destination receives extent x block-dims texels). The old code saw different formats
+    // and took the blit path; BC cannot be blitted, so every such copy was skipped and the
+    // destination filled flat grey — the black rider leathers. A copy is NOT a blit here.
+    const vkfmt_t *sf = vk_fmt(c->src->d.format), *df = vk_fmt(c->dst->d.format);
+    int compat = sf && df && sf->bpb && sf->bpb == df->bpb && sf->compressed != df->compressed;
+    // A mip smaller than one block cannot hold a whole block: skip (the 1x1 tail mips).
+    if (compat && ((df->compressed && (dw < (int32_t)df->bw || dh < (int32_t)df->bh)) || (sf->compressed && (sw < (int32_t)sf->bw || sh < (int32_t)sf->bh)))) {
+        static int sm; if (sm++ < 10) VKLOG("texture copy %d → %d: mip %u too small for a block (%dx%d), skipped (present %llu)",
+            s->fmt, d->fmt, (unsigned)ds.mipLevel, dw, dh, (unsigned long long)g_tex_frame);
+        vk_img_barrier_all(cb); return; }
     // NVNcopyFlags: LINEAR_FILTER 1, ENGINE_2D 2 (nothing to do here), MIRROR_X 4, MIRROR_Y 8, MIRROR_Z 0x10: a mirrored copy is a blit with the destination's offsets
     // swapped. Pokémon Sword 1.3.2 captures its picture for a door's fade with MIRROR_Y (its lower-left origin image turned over) and draws it back; copied
     // unmirrored, the fade showed the room upside down for 7 frames (Odin 2, 2026-11-13)
@@ -2336,28 +2648,41 @@ static void copy_t2t(const p_copy_t2t *c) {
     if (k.dr.xoffset + k.dr.width > dw) { VKRED_ONCE(74, "texture copy destination region clipped to its image"); k.dr.width = dw - k.dr.xoffset; if (same) k.sr.width = k.dr.width; }
     if (k.dr.yoffset + k.dr.height > dh) { VKRED_ONCE(74, "texture copy destination region clipped to its image"); k.dr.height = dh - k.dr.yoffset; if (same) k.sr.height = k.dr.height; }
     if (k.sr.width <= 0 || k.sr.height <= 0 || k.dr.width <= 0 || k.dr.height <= 0) { vk_img_barrier_all(cb); return; }
-    if (!(c->flags & DM_COPY_RESOLVE) && (mir || !(k.sr.width == k.dr.width && k.sr.height == k.dr.height && s->fmt == d->fmt))) {   // a blit: both formats must allow it (and linear filtering)
+    if (!(c->flags & DM_COPY_RESOLVE) && !compat && (mir || !(k.sr.width == k.dr.width && k.sr.height == k.dr.height && s->fmt == d->fmt))) {   // a blit: both formats must allow it (and linear filtering)
         VkFormatProperties sp, dp; vkGetPhysicalDeviceFormatProperties(V.pd, s->fmt, &sp); vkGetPhysicalDeviceFormatProperties(V.pd, d->fmt, &dp);
         if (!(sp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(dp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) || (s->aspect != d->aspect)) {
             if (depth_scale(cb, s, d, ss, ds, &k)) return;
-            VKRED_ONCE(75, "texture blit between formats %d → %d that cannot be blitted (%dx%d → %dx%d, present %llu): skipped", s->fmt, d->fmt, k.sr.width, k.sr.height, k.dr.width, k.dr.height, (unsigned long long)g_tex_frame); vk_img_barrier_all(cb); return; }
+            if (bc_flat_fill(cb, d, &ds, &k)) { static int n; if (n++ < 20) VKLOG("texture blit %d → %d (%dx%d) cannot be blitted: BC destination filled flat instead (present %llu)",
+                                                                                  s->fmt, d->fmt, k.dr.width, k.dr.height, (unsigned long long)g_tex_frame);
+                                                vk_img_barrier_all(cb); return; }
+            { static int ns; if (ns++ < 20) VKLOG("[RED] texture blit between formats %d → %d that cannot be blitted (%dx%d → %dx%d, present %llu): skipped (fill rejected)", s->fmt, d->fmt, k.sr.width, k.sr.height, k.dr.width, k.dr.height, (unsigned long long)g_tex_frame); }
+            vk_img_barrier_all(cb); return; }
         if (!(sp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) || (s->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) k.flags &= ~1u;   // nearest where linear is not allowed
     }
     if (!mir && s == d && !memcmp(&ss, &ds, sizeof ss) && k.sr.xoffset == k.dr.xoffset && k.sr.yoffset == k.dr.yoffset && k.sr.width == k.dr.width && k.sr.height == k.dr.height && k.sr.zoffset == k.dr.zoffset) {
         vk_img_barrier_all(cb); return; }   // a copy of a region onto itself (two textures over the same storage): nothing to do, and Vulkan forbids overlapping copies
+    if (c->dst->d.width == 2048 && c->dst->d.height == 2048 && (c->dst->d.format == 0x9a || c->dst->d.format == 0x44)) {
+        static int ct2e; if (ct2e++ < 200) VKLOG("copy_t2t: present %llu dst serial %llu fmt %#x src serial %llu region %dx%d -> %dx%d mip %u %s EXECUTED",
+            (unsigned long long)g_tex_frame, (unsigned long long)c->dst->serial, c->dst->d.format, (unsigned long long)c->src->serial,
+            k.sr.width, k.sr.height ? k.sr.height : 1, k.dr.width, k.dr.height ? k.dr.height : 1, (unsigned)ds.mipLevel,
+            (c->flags & DM_COPY_RESOLVE) ? "resolve" : compat ? "compat-copy" : (!mir && k.sr.width == k.dr.width && k.sr.height == k.dr.height && s->fmt == d->fmt) ? "copy" : "blit"); }
     if (c->flags & DM_COPY_RESOLVE) {
         VkImageResolve r = {ss, {c->sr.xoffset, c->sr.yoffset, 0}, ds, {c->dr.xoffset, c->dr.yoffset, 0}, {(uint32_t)c->sr.width, (uint32_t)c->sr.height, 1}};
         vkCmdResolveImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
-    } else if (!mir && c->sr.width == c->dr.width && c->sr.height == c->dr.height && s->fmt == d->fmt) {
+        d->gpu_w = 1;
+    } else if (!mir && (compat || (c->sr.width == c->dr.width && c->sr.height == c->dr.height && s->fmt == d->fmt))) {
         VkImageCopy r = {ss, {c->sr.xoffset, c->sr.yoffset, s->layers > 1 ? 0 : c->sr.zoffset}, ds, {c->dr.xoffset, c->dr.yoffset, d->layers > 1 ? 0 : c->dr.zoffset},
                          {(uint32_t)c->sr.width, (uint32_t)(c->sr.height ? c->sr.height : 1), s->layers > 1 ? 1 : (uint32_t)(c->sr.depth ? c->sr.depth : 1)}};
         vkCmdCopyImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        d->gpu_w = 1;   // set AFTER the copy executes, not before the checks: a skipped copy
+                        // must not mark the destination written (the black-leather bug).
     } else {
         VkImageBlit r = {ss, {{c->sr.xoffset, c->sr.yoffset, 0}, {c->sr.xoffset + c->sr.width, c->sr.yoffset + (c->sr.height ? c->sr.height : 1), 1}},
                          ds, {{c->dr.xoffset, c->dr.yoffset, 0}, {c->dr.xoffset + c->dr.width, c->dr.yoffset + (c->dr.height ? c->dr.height : 1), 1}}};
         if (mir & CF_MIRROR_X) { int32_t x = r.dstOffsets[0].x; r.dstOffsets[0].x = r.dstOffsets[1].x; r.dstOffsets[1].x = x; }
         if (mir & CF_MIRROR_Y) { int32_t y = r.dstOffsets[0].y; r.dstOffsets[0].y = r.dstOffsets[1].y; r.dstOffsets[1].y = y; }
         vkCmdBlitImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r, (c->flags & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        d->gpu_w = 1;
     }
     vk_img_barrier_all(cb);
 }
