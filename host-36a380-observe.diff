@@ -1,0 +1,345 @@
+diff --git a/nxnative/dm/host/dm_hook.c b/nxnative/dm/host/dm_hook.c
+--- a/nxnative/dm/host/dm_hook.c
++++ b/nxnative/dm/host/dm_hook.c
+@@ -1,7 +1,7 @@
+ // BRK hooks on guest code (DM_HOOK_1CED80C, DM_HOOK_E6E6AC, DM_HOOK_64EA18, DM_GFX_PRESET): when a static search cannot say what a
+ // function computes at run time, put a breakpoint on it and log the registers. Installed at load (probe_install, after the modules are
+ // loaded, before any guest code runs): the host writes a BRK over the original instruction, the SIGTRAP hook records the registers and
+-// emulates the displaced instruction in the handler, and the game runs on as if nothing happened. Five configurations instrument MotoGP 18
++// emulates the displaced instruction in the handler, and the game runs on as if nothing happened. Six configurations instrument MotoGP 18
+ // (main v0, build 758a0602b2c99b4395277296bc002848): the viewport-offset function (main+0x1ced80c: the gate result, the scale factors
+ // (s0, s1) it gets from a virtual call, that callee's address, and the offsets it stores), the projection function (main+0xe6e6ac: the
+ // cached-projection flag, the 16 cached-matrix floats, the view dimensions, and the computed projection terms), the size getter
+@@ -9,9 +9,12 @@
+ // (DM_GFX_PRESET: USettingsVideoManager's apply routine, main+0x1252f8, and its console-exec helper, main+0x125e90: the manager reads
+ // each cvar's value from its own map and console-execs "<cvar> <value>", which is why -ini args never stick; the hook rewrites the value
+ // string in place before the exec, so a preset chosen in env.txt actually applies — the observe run showed this manager never fires, so
+-// it is kept for completeness but the live route is the fifth), and the device-profile apply (DM_GFX_PRESET: main+0x177383c, the
+-// choke point through which every profile CVar passes at boot and on every profile change: the hook logs the whole map in observe mode
+-// and rewrites the preset CVars' values in the map before the original's loop applies them — see the deviation note at dp_points).
++// it is kept for completeness but the live route is the sixth), the device-profile restore (DM_GFX_PRESET: main+0x177383c, the restore
++// function that re-applies the previous values from the manager's map on a profile change — round 13 misread it as the applier and the
++// observe run showed its map empty at boot, so the hook is kept for the restore-map visibility but injects nothing), and the per-CVar
++// apply helper (DM_GFX_PRESET: main+0x36a380, the single funnel through which every CVar application at boot passes — profile and ini
++// sections alike: the hook logs each (name, value, flags, mode) in observe mode, and the follow-up preset round substitutes the value
++// at entry — see the note at h36_points).
+ // Each configuration is gated by its own env var and installs independently. Fixed addresses run only on the main build they were found
+ // in (AGENTS.md); any other build, or bytes that do not match the ones verified against the image, installs nothing. The displaced
+ // instructions are emulated in the handler (not run from a trampoline slot, as probe.c does): two of them are conditional branches, whose
+@@ -88,11 +91,11 @@
+     { 0x125310, 0xaa0003f3 },   // mov x19, x0 (x0 is the manager object; lr is still the entry value)
+     { 0x125e90, 0xd10243ff },   // sub sp, sp, #0x90 (the helper's first instruction; x1 = name FString, x2 = value FString)
+ };
+-// The device-profile apply (main+0x177383c, size 0x204). It iterates the manager's name->value map ([x0+0xb8], entries 0x28 B:
++// The device-profile restore (main+0x177383c, size 0x204). It iterates the manager's name->value map ([x0+0xb8], entries 0x28 B:
+ // {FString Key @+0x00, FString Value @+0x10}) and, per entry, calls FindConsoleVariable + IConsoleVariable::Set(value, 0x4000000).
+-// This is the choke point through which EVERY profile CVar passes at boot and on every profile change (dp.Override) — the
+-// USettingsVideoManager hook above it never fires (0 calls in 409 s of gameplay), so this is the route that actually reaches the
+-// values the game uses. The entry hook sits on the function's first instruction (stp x28, x27, [sp, #-0x60]!): x0 is the manager,
++// Round 13 misread this as the choke point through which EVERY profile CVar passes at boot; round 15 proved it is the RESTORE
++// function (it re-applies the PREVIOUS values saved in the map, and the map is empty by design at boot — see the correction note
++// below). The entry hook sits on the function's first instruction (stp x28, x27, [sp, #-0x60]!): x0 is the manager,
+ // lr the caller, and the whole map is in memory at entry.
+ //
+ // DEVIATION FROM SHAPE #3 — READ THIS BEFORE CHANGING THE PRESET PATH. Gemini chose shape #3 (run the original, then a preset
+@@ -108,9 +111,28 @@
+ // and the flush histogram reports which preset CVars were never seen, so the gap (if any) is visible and Gemini can decide
+ // whether a guest-call loop is worth it for the missing ones. Observe mode only reads; preset modes only rewrite values that
+ // fit (TOOLONG otherwise); a value already equal to the preset is left alone (SAME), so re-applies are harmless.
++//
++// CORRECTION (round 15, FINDINGS_BOOTAPPLY.md): 0x177383c is the RESTORE function, not the applier — it re-applies the PREVIOUS
++// values saved in the map, and the map is empty by design at boot (the selection empties it at its start and only fills it on a
++// profile change, mode 1). The real boot applier is 0x1772084 -> 0x36a380 (see h36_points below). This hook stays installed: its
++// observe log is still the only view of the restore map, and its map-rewrite path is harmless on an empty map.
+ enum { DP_APPLY = 0, DP_N };
+ static const hook_point dp_points[DP_N] = {
+-    { 0x177383c, 0xa9ba6ffc },   // stp x28, x27, [sp, #-0x60]! (the apply routine's first instruction; x0 is the manager)
++    { 0x177383c, 0xa9ba6ffc },   // stp x28, x27, [sp, #-0x60]! (the restore routine's first instruction; x0 is the manager)
++};
++// The per-CVar apply helper (main+0x36a380, size 0x3b4). The REAL boot applier (round 15, FINDINGS_BOOTAPPLY.md): every CVar
++// application at boot funnels through it — the device-profile selection (0x1772084 loop 3, flags 0x4000000), the five ini
++// sections (0x368bbc, flags 0x3000000) and ConsoleVariables.ini (0x3688d4 -> 0x368bbc, flags 0x5000000); it has exactly two BL
++// callers in the binary (0x368d90, 0x17728e8). At entry x1 is the CVar name and x2 the value, BOTH AS TCHAR* (NUL-terminated
++// UTF-32 strings — NOT FStrings: the function reads wchars straight off x2, 0x36a3a0 `ldr w0, [x23]`, and both call sites pass
++// Data pointers, 0x17728dc / 0x368d78 `ldr x2, [x8]`), w3 the flags, w4 the mode. Inside it normalizes the value, looks the CVar
++// up (FindConsoleVariable, slot 0x90) and tail-calls IConsoleVariable::Set (slot 0x68) at 0x36a6dc — or registers an unknown
++// CVar. The entry hook sits on the function's first instruction (sub sp, sp, #0x60). THIS ROUND IS OBSERVE ONLY: the handler
++// logs every (name, value, flags, mode) and writes NOTHING to guest memory. The follow-up preset round substitutes the value
++// (redirect x2 to a preset value string, filtered by w3 == 0x4000000) — the Gemini-approved shape, not in this diff.
++enum { H36_APPLY = 0, H36_N };
++static const hook_point h36_points[H36_N] = {
++    { 0x36a380, 0xd10183ff },   // sub sp, sp, #0x60 (the helper's first instruction; x1 = name TCHAR*, x2 = value TCHAR*)
+ };
+ static uint8_t *g_base;                 // main's base (set at install)
+ static uint64_t g_at[HOOK_N];           // absolute hook addresses (1ced80c)
+@@ -118,8 +140,9 @@
+ static uint64_t s64_at[S64_N];          // absolute hook addresses (64ea18)
+ static uint64_t gfx_at[GFX_N];          // absolute hook addresses (1252f8/125e90)
+ static uint64_t dp_at[DP_N];            // absolute hook addresses (177383c)
++static uint64_t h36_at[H36_N];          // absolute hook addresses (36a380)
+ static _Atomic int g_installed;         // the trap hook is chained (either configuration installed)
+-static int g_hooked_1c, g_hooked_e6, g_hooked_64, g_hooked_gfx, g_hooked_dp;   // which configurations installed (set at install, read by the trap hook)
++static int g_hooked_1c, g_hooked_e6, g_hooked_64, g_hooked_gfx, g_hooked_dp, g_hooked_36;   // which configurations installed (set at install, read by the trap hook)
+ static int (*g_prev)(ucontext_t *uc);   // the trap hook before ours (probe.c's, if any)
+ 
+ // One call of 0x1ced80c, as the flush thread logs it. The four hooks of a call run on one thread in order (gate, blr, ldp, stp: the code
+@@ -211,6 +234,26 @@
+ static _Atomic uint64_t dp_seq;
+ static __thread int dp_busy;   // anti-recursion guard for the trap handler (defensive: it calls no guest code)
+ 
++// One 0x36a380 call, as the flush thread logs it. The name and the value are copied out as ASCII in the handler (the guest
++// strings are NUL-terminated UTF-32); the record is self-contained, so the flush thread never touches guest memory. The flags
++// (w3) identify the source: 0x4000000 = device profile, 0x3000000 = ini sections, 0x5000000 = ConsoleVariables.ini. The
++// sequence number is the call order — the sg.* delegate-ordering analysis needs it.
++enum { H36_ACT_KEEP = 0, H36_ACT_UNREADABLE };
++typedef struct {
++    _Atomic int ready;
++    uint64_t seq;
++    int action;
++    uint64_t lr;
++    uint32_t flags;   // w3
++    uint32_t mode;    // w4
++    char name[64];    // the cvar name ("fx.maxCPUParticlesPerEmitter" is 28 chars; 64 covers the longest engine names)
++    char value[64];   // the value as supplied (values are short: "100", "15", "True"; 64 covers the longest)
++} h36_rec;
++enum { H36_RING = 4096 };
++static h36_rec h36_ring[H36_RING];
++static _Atomic uint64_t h36_seq;
++static __thread int h36_busy;   // anti-recursion guard for the trap handler (defensive: it calls no guest code)
++
+ // The manager's 15 cvars, in the apply routine's order (each is referenced twice there: map lookup + console-exec). r.VSync and t.MaxFPS
+ // are recognised but never overridden: the FPS unlock (DM_PRESENT_INTERVAL=display, menu 40fps) and the display-res override depend on
+ // them. PoolSize, LODGroups and r.Shadow.MaxResolution are NOT in this table and cannot be injected this way: they are config structs,
+@@ -320,6 +363,16 @@
+     memcpy(d->newv, r->newv, sizeof d->newv);
+     atomic_store_explicit(&d->ready, 1, memory_order_release);
+ }
++static void h36_commit(const h36_rec *r) {   // signal context: an atomic claim and plain stores, as hook_commit does
++    uint64_t s = atomic_fetch_add_explicit(&h36_seq, 1, memory_order_relaxed);
++    h36_rec *d = &h36_ring[s & (H36_RING - 1)];
++    atomic_store_explicit(&d->ready, 0, memory_order_relaxed);
++    d->seq = s; d->action = r->action; d->lr = r->lr;
++    d->flags = r->flags; d->mode = r->mode;
++    memcpy(d->name, r->name, sizeof d->name);
++    memcpy(d->value, r->value, sizeof d->value);
++    atomic_store_explicit(&d->ready, 1, memory_order_release);
++}
+ // Read a guest FString (UE4: { TCHAR* Data @0, int32 Num @8, int32 Max @12 }, TCHAR = 32-bit wchar_t) as ASCII. Returns the character
+ // count (excluding the NUL) or -1 when the header or the buffer cannot be read, the length is out of range, or a character is not
+ // printable ASCII. The buffer is always NUL-terminated. Signal context: hook_read only, no allocation.
+@@ -340,6 +393,27 @@
+     out[num - 1] = '\0';
+     return num - 1;
+ }
++// Read a guest TCHAR* (a NUL-terminated UTF-32 string, NOT an FString: no header, no length — the string ends at the first
++// zero wchar) as ASCII. Returns the character count (excluding the NUL) or -1 when the pointer is null, the buffer cannot be
++// read, no NUL appears within the cap, or a character is not printable ASCII. The buffer is always NUL-terminated. The read
++// is chunked (8 wchars at a time) so a short string near a page boundary does not over-read into an unmapped page. Signal
++// context: hook_read only, no allocation.
++static int gfx_read_tstr(uint64_t ts, char *out, size_t cap) {
++    if (!ts || cap < 2) return -1;
++    if (cap > 64) cap = 64;
++    size_t n = 0;
++    while (n < cap) {
++        size_t chunk = cap - n > 8 ? 8 : cap - n;
++        uint32_t w[8];
++        if (!hook_read(ts + n * 4, w, chunk * 4)) return -1;
++        for (size_t i = 0; i < chunk; i++) {
++            if (w[i] == 0) { out[n] = '\0'; return (int)n; }
++            if (w[i] < 0x20 || w[i] > 0x7e) return -1;
++            out[n++] = (char)w[i];
++        }
++    }
++    return -1;   // no NUL within the cap: not a string we trust
++}
+ // Rewrite a guest FString's value in place: the new wchar string + NUL into its Data buffer, then the new length into Num (the helper
+ // copies Num-1 characters, so a stale Num would carry the old tail). Only call when strlen(newval)+1 <= Num (checked by the caller).
+ // Returns 1 when both writes landed.
+@@ -621,6 +695,37 @@
+     dp_busy = 0;
+     return 1;
+ }
++static int h36_trap(ucontext_t *uc, int hid) {   // the per-CVar apply dispatch (hook_trap): 1 = handled, resume at the emulated pc
++    _STRUCT_ARM_THREAD_STATE64 *ss = DM_UC_SS(uc);
++    uint64_t pc = ss->__pc;
++    uint32_t orig = h36_points[hid].orig;
++    // Emulate the displaced instruction FIRST: sub sp, sp, #0x60 — the decode is checked against the word (0xd10183ff: sf 1,
++    // op 1 = SUB, imm12 0x60, sh 0, rn 31 = sp, rd 31 = sp). The logic below only reads x1/x2/w3/w4/lr, which the sub does not
++    // touch, so the order is safe; and a re-entered call still gets its instruction emulated.
++    uint64_t imm = (orig >> 10) & 0xfff;   // SUB (immediate): imm12, shifted 12 when sh is set
++    if ((orig >> 22) & 1) imm <<= 12;
++    ss->__sp -= imm;
++    ss->__pc = pc + 4;
++    if (h36_busy) return 1;   // re-entered (defensive: the logic below calls no guest code, so this never trips)
++    h36_busy = 1;
++    // OBSERVE ONLY: read the name (x1) and the value (x2) as TCHAR* and log them with the flags (w3) and the mode (w4).
++    // Nothing is written to guest memory here — the preset substitution comes in a follow-up diff.
++    h36_rec r; memset(&r, 0, sizeof r);
++    r.action = H36_ACT_UNREADABLE;
++    r.lr = ss->__lr;
++    r.flags = (uint32_t)ss->__x[3];
++    r.mode = (uint32_t)ss->__x[4];
++    char name[64] = { 0 }, value[64] = { 0 };
++    if (gfx_read_tstr(ss->__x[1], name, sizeof name) >= 0 &&
++        gfx_read_tstr(ss->__x[2], value, sizeof value) >= 0) {
++        memcpy(r.name, name, sizeof r.name);
++        memcpy(r.value, value, sizeof r.value);
++        r.action = H36_ACT_KEEP;
++    }
++    h36_commit(&r);
++    h36_busy = 0;
++    return 1;
++}
+ static int hook_trap(ucontext_t *uc) {   // the SIGTRAP hook (crash.c): 1 = handled, resume at the emulated pc; anything else chains on
+     if (!atomic_load_explicit(&g_installed, memory_order_acquire)) return g_prev ? g_prev(uc) : 0;
+     uint64_t pc = DM_UC_SS(uc)->__pc;
+@@ -638,8 +743,11 @@
+         if (gid >= 0) return gfx_trap(uc, gid);
+         int did = -1;
+         if (g_hooked_dp) for (int i = 0; i < DP_N; i++) if (pc == dp_at[i]) { did = i; break; }
+-        if (did < 0) return g_prev ? g_prev(uc) : 0;
+-        return dp_trap(uc, did);
++        if (did >= 0) return dp_trap(uc, did);
++        int hid = -1;
++        if (g_hooked_36) for (int i = 0; i < H36_N; i++) if (pc == h36_at[i]) { hid = i; break; }
++        if (hid < 0) return g_prev ? g_prev(uc) : 0;
++        return h36_trap(uc, hid);
+     }
+     _STRUCT_ARM_THREAD_STATE64 *ss = DM_UC_SS(uc);
+     uint32_t orig = k_points[id].orig;
+@@ -1047,6 +1155,105 @@
+     }
+     return NULL;
+ }
++// Render a preset-CVar source mask (bit 0 = profile 0x4000000, bit 1 = ini 0x3000000, bit 2 = ConsoleVariables.ini 0x5000000,
++// bit 3 = other flags) as "profile+ini".
++static void h36_src_str(uint32_t src, char *buf, size_t cap) {
++    static const struct { uint32_t bit; const char *label; } tab[4] = {
++        { 1u, "profile" }, { 2u, "ini" }, { 4u, "consolevars" }, { 8u, "other" } };
++    size_t off = 0;
++    buf[0] = '\0';
++    for (int j = 0; j < 4; j++) if (src & tab[j].bit) {
++        int w = snprintf(buf + off, cap - off, "%s%s", off ? "+" : "", tab[j].label);
++        if (w < 0 || off + (size_t)w >= cap) break;
++        off += (size_t)w;
++    }
++}
++static void *h36_flush(void *p) {   // drain the ring to the log: a full line for every apply call (boot applies are bounded —
++    (void)p;                       // the profile plus the ini sections are a few hundred calls at most — so nothing is sampled),
++                                   // then a histogram every 10 s, including per-preset-CVar coverage (seen count + which sources
++                                   // applied it + the last value seen) and the preset CVars never seen at all (the follow-up preset
++                                   // round cannot reach those through this hook: see the note at h36_points)
++    uint64_t next = 0, total = 0, unread = 0, last_hist = 0;
++    struct { char name[64]; char value[64]; uint32_t flags, mode; uint64_t n; } hist[64];
++    int nhist = 0;
++    uint64_t other = 0;
++    int nlow = (int)(sizeof gfx_low / sizeof *gfx_low);   // gfx_low holds all 13 preset CVars (the union of the three presets)
++    // Per-preset-CVar coverage: how many times it was applied, from which sources (bit 0 = profile 0x4000000, bit 1 = ini
++    // 0x3000000, bit 2 = ConsoleVariables.ini 0x5000000, bit 3 = other flags), and the last value + flags seen.
++    struct { uint64_t n; uint32_t src; char lastv[64]; uint32_t lastflags; } seen[16];   // 16 is headroom over the 13 preset CVars
++    memset(seen, 0, sizeof seen);
++    for (;;) {
++        usleep(200000);
++        uint64_t upto = atomic_load_explicit(&h36_seq, memory_order_acquire);
++        while (next < upto) {
++            h36_rec *r = &h36_ring[next & (H36_RING - 1)];
++            if (!atomic_load_explicit(&r->ready, memory_order_acquire)) break;   // not published yet; retry next round
++            uint64_t s1 = r->seq;
++            h36_rec c = *r;
++            if (r->seq != s1) break;   // torn by an overwrite; retry next round
++            if (s1 != next) {
++                if (s1 > next) { LOG("[RED] hook-36: ring overran, %llu records lost", (unsigned long long)(s1 - next)); next = s1; continue; }
++                break;   // a stale slot: the record for next is not published yet
++            }
++            next++; total++;
++            char lb[192];
++            crash_addr_str(lb, sizeof lb, c.lr);
++            if (c.action == H36_ACT_UNREADABLE) {
++                unread++;
++                LOG("hook-36: call #%llu: TCHAR unreadable (flags %08x mode %u lr %s)", (unsigned long long)total,
++                    c.flags, c.mode, lb);
++                continue;
++            }
++            LOG("hook-36: call #%llu %s: '%s' [flags %08x mode %u] lr %s", (unsigned long long)total,
++                c.name, c.value, c.flags, c.mode, lb);
++            for (int i = 0; i < nlow; i++) if (!strcmp(c.name, gfx_low[i].name)) {
++                seen[i].n++;
++                seen[i].src |= c.flags == 0x4000000 ? 1u : c.flags == 0x3000000 ? 2u :
++                             c.flags == 0x5000000 ? 4u : 8u;
++                memcpy(seen[i].lastv, c.value, sizeof seen[i].lastv);
++                seen[i].lastflags = c.flags;
++            }
++            int k = 0;
++            while (k < nhist && (strcmp(hist[k].name, c.name) || strcmp(hist[k].value, c.value) ||
++                   hist[k].flags != c.flags || hist[k].mode != c.mode)) k++;
++            if (k < nhist) hist[k].n++;
++            else if (nhist < 64) { memcpy(hist[nhist].name, c.name, sizeof hist[nhist].name);
++                memcpy(hist[nhist].value, c.value, sizeof hist[nhist].value);
++                hist[nhist].flags = c.flags; hist[nhist].mode = c.mode; hist[nhist].n = 1; nhist++; }
++            else other++;
++        }
++        uint64_t now = now_ns();
++        if (total && now - last_hist >= 10000000000ull) {
++            last_hist = now;
++            LOG("hook-36: histogram (%llu calls, %llu unreadable):", (unsigned long long)total, (unsigned long long)unread);
++            for (int k = 0; k < nhist; k++)
++                LOG("hook-36:   %s: '%s' [flags %08x mode %u]: %llu", hist[k].name, hist[k].value,
++                    hist[k].flags, hist[k].mode, (unsigned long long)hist[k].n);
++            if (other) LOG("hook-36:   other tuples: %llu calls", (unsigned long long)other);
++            int nseen = 0;
++            for (int i = 0; i < nlow; i++) if (seen[i].n) nseen++;
++            LOG("hook-36:   preset CVars seen (%d of %d):", nseen, nlow);
++            for (int i = 0; i < nlow; i++) if (seen[i].n) {
++                char src[48];
++                h36_src_str(seen[i].src, src, sizeof src);
++                LOG("hook-36:     %s: %llux [%s] last '%s' flags %08x", gfx_low[i].name,
++                    (unsigned long long)seen[i].n, src, seen[i].lastv, seen[i].lastflags);
++            }
++            int nmiss = nlow - nseen;
++            if (nmiss) {
++                char miss[512] = { 0 };
++                size_t off = 0;
++                for (int i = 0; i < nlow; i++) if (!seen[i].n) {
++                    int w = snprintf(miss + off, sizeof miss - off, "%s%s", off ? ", " : "", gfx_low[i].name);
++                    if (w < 0 || off + (size_t)w >= sizeof miss) break;
++                    off += (size_t)w;
++                }
++                LOG("hook-36:   preset CVars never seen (%d): %s", nmiss, miss);
++            }
++        }
++    }
++    return NULL;
++}
+ static int hook_install_points(const hook_point *pts, int n, uint64_t *at, const char *env) {   // verify the words, then write the BRKs
+     for (int i = 0; i < n; i++) {                                                               // (rollback on failure, as before)
+         uint32_t cur = *(uint32_t *)(g_base + pts[i].off);
+@@ -1085,8 +1292,8 @@
+     { const char *e = getenv("DM_HOOK_1CED80C"); want1 = e && atoi(e); }
+     { const char *e = getenv("DM_HOOK_E6E6AC"); want6 = e && atoi(e); }
+     { const char *e = getenv("DM_HOOK_64EA18"); want4 = e && atoi(e); }
+-    {   // DM_GFX_PRESET=observe|low|medium|high: the graphics-manager hooks + the device-profile apply hook + the preset to inject
+-        // (unset = off). Parsed once here; the trap handlers only read g_gfx_mode, never the environment.
++    {   // DM_GFX_PRESET=observe|low|medium|high: the graphics-manager hooks + the device-profile restore hook + the per-CVar
++        // apply hook + the preset to inject (unset = off). Parsed once here; the trap handlers only read g_gfx_mode, never the environment.
+         const char *e = getenv("DM_GFX_PRESET");
+         if (e && *e) {
+             if (!strcmp(e, "observe")) { wantg = 1; g_gfx_mode = GFX_MODE_OBSERVE; }
+@@ -1107,7 +1314,8 @@
+     if (want4) g_hooked_64 = hook_install_points(s64_points, S64_N, s64_at, "DM_HOOK_64EA18");
+     if (wantg) g_hooked_gfx = hook_install_points(gfx_points, GFX_N, gfx_at, "DM_GFX_PRESET");
+     if (wantg) g_hooked_dp = hook_install_points(dp_points, DP_N, dp_at, "DM_GFX_PRESET");
+-    if (!g_hooked_1c && !g_hooked_e6 && !g_hooked_64 && !g_hooked_gfx && !g_hooked_dp) return;
++    if (wantg) g_hooked_36 = hook_install_points(h36_points, H36_N, h36_at, "DM_GFX_PRESET");
++    if (!g_hooked_1c && !g_hooked_e6 && !g_hooked_64 && !g_hooked_gfx && !g_hooked_dp && !g_hooked_36) return;
+     g_prev = crash_trap_hook();
+     crash_set_trap_hook(hook_trap);
+     atomic_store_explicit(&g_installed, 1, memory_order_release);
+@@ -1126,4 +1334,8 @@
+         LOG("hook-dp: 1 breakpoint at main+0x177383c (DM_GFX_PRESET=%s)",
+             g_gfx_mode == GFX_MODE_LOW ? "low" : g_gfx_mode == GFX_MODE_MEDIUM ? "medium" :
+             g_gfx_mode == GFX_MODE_HIGH ? "high" : "observe"); }
++    if (g_hooked_36) { pthread_create(&th, NULL, h36_flush, NULL); pthread_detach(th);
++        LOG("hook-36: 1 breakpoint at main+0x36a380 (DM_GFX_PRESET=%s, observe only)",
++            g_gfx_mode == GFX_MODE_LOW ? "low" : g_gfx_mode == GFX_MODE_MEDIUM ? "medium" :
++            g_gfx_mode == GFX_MODE_HIGH ? "high" : "observe"); }
+ }

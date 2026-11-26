@@ -1,0 +1,54 @@
+diff --git a/nxnative/dm/host/hle_misc.c b/nxnative/dm/host/hle_misc.c
+index a248b0d..8255a68 100644
+--- a/nxnative/dm/host/hle_misc.c
++++ b/nxnative/dm/host/hle_misc.c
+@@ -105,10 +105,10 @@ HLE_FORCE("_ZN2nn3err9ShowErrorENS_6ResultE", "error display applet; the host pr
+ // The class is polymorphic, and games call it through its vtable too: Monster Hunter Rise checks the hunter's name with slot 8, MaskProfanityWordsInText(int *, char16_t *, uint32_t)
+ // (main+0x6bca160). The constructor used to do nothing, the object kept what the heap held there, and that call jumped into the heap. It now gets a host vtable: each slot of the SDK's
+ // (_ZTVN2nn3ngc15ProfanityFilterE) is matched by address with the class's methods and given the host's version (no word list: nothing is profanity, nothing is masked); others return 0
+-static Result ngc_v_zero(void) { return RES_OK; }
++static Result ngc_v_zero(void) { static int n; if (n++ < 8) LOG("[RED] ngc: unmatched ProfanityFilter vtable slot called (call %d, return %p)", n, __builtin_return_address(0)); return RES_OK; }
+ static void ngc_v_none(void *self) { (void)self; }
+-static Result ngc_v_check(void *self, uint32_t *masks, uint32_t pat, const void **words, uint64_t n) { (void)self; (void)pat; (void)words; for (uint64_t i = 0; masks && i < n; i++) masks[i] = 0; return RES_OK; }
+-static Result ngc_v_mask(void *self, int *masked, void *text, uint32_t region) { (void)self; (void)text; (void)region; if (masked) *masked = 0; return RES_OK; }
++static Result ngc_v_check(void *self, uint32_t *masks, uint32_t pat, const void **words, uint64_t n) { static int c; if (!c++) LOG("ngc: CheckProfanityWords through vtable (%llu words, all clean)", (unsigned long long)n); (void)self; (void)pat; (void)words; for (uint64_t i = 0; masks && i < n; i++) masks[i] = 0; return RES_OK; }
++static Result ngc_v_mask(void *self, int *masked, void *text, uint32_t region) { static int c; if (!c++) LOG("ngc: MaskProfanityWordsInText through vtable (nothing masked)"); (void)self; (void)text; (void)region; if (masked) *masked = 0; return RES_OK; }
+ static void *ngc_vtable(void) {
+     enum { NV = 40 }; static void *vt[NV + 2]; static int built;
+     if (built) return built > 0 ? &vt[2] : NULL;
+@@ -127,9 +127,12 @@ static void *ngc_vtable(void) {
+     // A slot holds SDK code, or the host's version where the loader bound the slot by name to a forced take-over (Initialize, GetContentVersion, CheckProfanityWords): those stay.
+     // The table ends at the first value that is neither (Monster Hunter Rise's SDK: 9 slots, then a 1)
+     for (; n < NV && (uintptr_t)sdk[2 + n] >= 0x10000; n++) {
+-        if (module_of(sdk[2 + n]) != mod) { if (module_of(sdk[2 + n])) break; vt[2 + n] = sdk[2 + n]; continue; }   // another guest module: not this class's table
++        if (module_of(sdk[2 + n]) != mod) { if (module_of(sdk[2 + n])) break; vt[2 + n] = sdk[2 + n]; LOG("ngc: slot %d kept (loader-bound host code %p)", n, sdk[2 + n]); continue; }   // another guest module: not this class's table
+         vt[2 + n] = (void *)ngc_v_zero;
+-        for (unsigned k = 0; k < sizeof M / sizeof *M; k++) if (addr[k] && sdk[2 + n] == addr[k]) { vt[2 + n] = M[k].fn; named++; break; }
++        int hit = -1;
++        for (unsigned k = 0; k < sizeof M / sizeof *M; k++) if (addr[k] && sdk[2 + n] == addr[k]) { vt[2 + n] = M[k].fn; named++; hit = (int)k; break; }
++        if (hit >= 0) LOG("ngc: slot %d matched %s", n, M[hit].name);
++        else LOG("ngc: slot %d UNMATCHED (sdk %p, returns 0, writes nothing)", n, sdk[2 + n]);
+     }
+     built = 1; LOG("ngc: ProfanityFilter host vtable of %d slots (%d matched to the class's methods)", n, named);
+     return &vt[2];
+diff --git a/nxnative/dm/host/hle_swkbd.c b/nxnative/dm/host/hle_swkbd.c
+index eebb63d..0402ef2 100644
+--- a/nxnative/dm/host/hle_swkbd.c
++++ b/nxnative/dm/host/hle_swkbd.c
+@@ -83,7 +83,7 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
+     int r = script ? (snprintf(text, sizeof text, "%s", script), 1) : input(title, sub, guide, init, maxlen > 0 ? maxlen : 0, text, sizeof text);
+     g_swkbd_min_chars = -1;
+     g_swkbd_numeric_max = -1;   // the numeric box mark applies to this one time only (set by dm_textinput.c before bringing up the keyboard)
+-    LOG("swkbd: title '%s' initial '%s' limit %d → %s%s%s", title, init, maxlen,
++    LOG("swkbd: title '%s' initial '%s' limit %d min %d utf8 %d → %s%s%s", title, init, maxlen, minlen, (int)arg[ARG_UTF8],
+         r > 0 ? "OK '" : r == 0 ? "cancel" : "no window, treated as cancel", r > 0 ? text : "", r > 0 ? "'" : "");
+     if (r <= 0) return SWKBD_RESULT_CANCELED;
+     if (g_swkbd_name_panel && g_swkbd_unfilter && g_swkbd_unfilter()) LOG("swkbd: naming panel -- turned off the game's ASCII input filter on the returned string (Chinese names allowed, see hle_charname.c)");
+@@ -94,6 +94,7 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
+     uint16_t u16[1003]; size_t n = swkbd_u8_to_u16(text, maxlen > 0 ? (size_t)maxlen : 1002, u16, 1003);   // truncate to the character limit (counted in UTF-16 units)
+     if (arg[ARG_UTF8]) swkbd_u16_to_u8(u16, n, (char *)buf, cap);
+     else memcpy(buf, u16, (n + 1) * 2 <= cap ? n * 2 : (cap / 2 - 1) * 2);
++    LOG("swkbd: wrote back %zu chars as %s (buffer %p, cap %llu)", n, arg[ARG_UTF8] ? "UTF-8" : "UTF-16", (void *)buf, (unsigned long long)cap);
+     { const char *lag = getenv("DM_TEST_SWKBD_LAG_MS"); if (lag) usleep((useconds_t)atoi(lag) * 1000); }   // test: slow down "keyboard handed back → the game's thread gets the result" to verify that auto-accept does not jump the gun   // front end path cleanup (dm_cursor.c): auto-accept after the name is typed on the naming page
+     return RES_OK;
+ }

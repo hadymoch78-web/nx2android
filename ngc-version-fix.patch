@@ -1,0 +1,29 @@
+diff --git a/nxnative/dm/host/hle_misc.c b/nxnative/dm/host/hle_misc.c
+index a248b0d..791b6ec 100644
+--- a/nxnative/dm/host/hle_misc.c
++++ b/nxnative/dm/host/hle_misc.c
+@@ -106,6 +106,7 @@ HLE_FORCE("_ZN2nn3err9ShowErrorENS_6ResultE", "error display applet; the host pr
+ // (main+0x6bca160). The constructor used to do nothing, the object kept what the heap held there, and that call jumped into the heap. It now gets a host vtable: each slot of the SDK's
+ // (_ZTVN2nn3ngc15ProfanityFilterE) is matched by address with the class's methods and given the host's version (no word list: nothing is profanity, nothing is masked); others return 0
+ static Result ngc_v_zero(void) { return RES_OK; }
++static uint32_t ngc_v_one(void) { return 1; }
+ static void ngc_v_none(void *self) { (void)self; }
+ static Result ngc_v_check(void *self, uint32_t *masks, uint32_t pat, const void **words, uint64_t n) { (void)self; (void)pat; (void)words; for (uint64_t i = 0; masks && i < n; i++) masks[i] = 0; return RES_OK; }
+ static Result ngc_v_mask(void *self, int *masked, void *text, uint32_t region) { (void)self; (void)text; (void)region; if (masked) *masked = 0; return RES_OK; }
+@@ -116,6 +117,7 @@ static void *ngc_vtable(void) {
+     if (!sdk) { built = -1; LOG("[RED] ProfanityFilter: the SDK has no vtable symbol; objects keep none"); return NULL; }
+     static const struct { const char *name; void *fn; } M[] = {
+         {"_ZN2nn3ngc15ProfanityFilterD1Ev", (void *)ngc_v_none}, {"_ZN2nn3ngc15ProfanityFilterD0Ev", (void *)ngc_v_none}, {"_ZN2nn3ngc15ProfanityFilter8FinalizeEv", (void *)ngc_v_none},
++        {"_ZN2nn3ngc15ProfanityFilter17GetContentVersionEv", (void *)ngc_v_one},
+         {"_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKcm", (void *)ngc_v_check}, {"_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKDsm", (void *)ngc_v_check},
+         {"_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKtm", (void *)ngc_v_check},
+         {"_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPcj", (void *)ngc_v_mask}, {"_ZN2nn3ngc15ProfanityFilter24MaskProfanityWordsInTextEPiPDsj", (void *)ngc_v_mask},
+@@ -139,7 +141,7 @@ HLE_FORCE("_ZN2nn3ngc15ProfanityFilterC1Ev", "profanity filter, the word list is
+ }
+ HLE_FORCE("_ZN2nn3ngc15ProfanityFilterD1Ev", "profanity filter", void, h_ngc_Dtor, void *self) { (void)self; }
+ HLE_FORCE("_ZN2nn3ngc15ProfanityFilter10InitializeEPvm", "profanity filter init; the host has no word list", Result, h_ngc_Init, void *self, void *work, uint64_t sz) { (void)self; (void)work; (void)sz; return RES_OK; }
+-HLE_FORCE("_ZN2nn3ngc15ProfanityFilter17GetContentVersionEv", "word list version; the host returns 0", uint32_t, h_ngc_Ver, void *self) { (void)self; return 0; }
++HLE_FORCE("_ZN2nn3ngc15ProfanityFilter17GetContentVersionEv", "word list version; the host reports version 1 (a version of 0 reads as 'no word list', and games fail closed on it)", uint32_t, h_ngc_Ver, void *self) { (void)self; return 1; }
+ HLE_FORCE("_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKcm", "profanity check; never a hit", Result, h_ngc_Check, void *self, uint32_t *masks, uint32_t pat, const char **words, uint64_t n) {
+     (void)self; (void)pat; (void)words;
+     for (uint64_t i = 0; i < n; i++) masks[i] = 0;

@@ -1,0 +1,523 @@
+diff --git a/nxnative/dm/android/apk/mkapk.py b/nxnative/dm/android/apk/mkapk.py
+index 1764910..a67f30e 100644
+--- a/nxnative/dm/android/apk/mkapk.py
++++ b/nxnative/dm/android/apk/mkapk.py
+@@ -14,11 +14,13 @@ _p.add_argument('--icon-bg', help='the adaptive icon\'s background layer (a PNG,
+ _p.add_argument('--asset', action='append', default=[], metavar='NAME=FILE', help='a file the app reads with AAssetManager as NAME (assets/NAME in the APK): the gamepad theme')
+ _p.add_argument('--dex', help='optional classes.dex for a custom NativeActivity')
+ _p.add_argument('--activity', default='android.app.NativeActivity', help='NativeActivity class name')
++_p.add_argument('--picker', action='store_true', help='a driver choice on launch: org.nx2a.DriverPickerActivity becomes the launcher activity and the NativeActivity starts from it (needs --dex)')
+ _p.add_argument('--release', action='store_true', help='not debuggable')
+ _p.add_argument('--version-code', type=int, default=1, help='versionCode: a later port of the game must have a higher one to install over it')
+ _p.add_argument('--version-name', default='1.0', help='versionName: the version the player sees (the game\'s display version)'); ARGS = _p.parse_args()
+ PKG, LIB, LABEL = ARGS.package, ARGS.lib, ARGS.label
+ if ARGS.activity != 'android.app.NativeActivity' and not ARGS.dex: _p.error('--activity requires --dex')
++if ARGS.picker and not ARGS.dex: _p.error('--picker requires --dex')
+ if bool(ARGS.icon_fg) != bool(ARGS.icon_bg) or (ARGS.icon_fg and not ARGS.icon): _p.error('--icon-fg and --icon-bg go together, with --icon')
+ MIN_SDK, TARGET_SDK = 29, 36
+ ANDROID_NS = 'http://schemas.android.com/apk/res/android'
+@@ -40,6 +42,19 @@ ICON_ID, ICON_FG_ID, ICON_BG_ID = 0x7f010000, 0x7f010001, 0x7f010002   # drawabl
+ # A plain icon is drawn small on a white disc by Android 8+ launchers; an adaptive one fills the launcher's icon shape
+ ADAPTIVE_ICON = ('adaptive-icon', [], [('background', [(True, 'drawable', ('ref', ICON_BG_ID))], []), ('foreground', [(True, 'drawable', ('ref', ICON_FG_ID))], [])])
+ 
++# The game's activity: the launcher by itself, or started by the driver picker (--picker), which then owns the LAUNCHER filter. The picker is a plain
++# Activity (no lib_name: it loads no native code), the game activity keeps its lib_name and stays exported so the picker can start it.
++GAME_ACTIVITY = ('activity', [(True, 'name', ARGS.activity), (True, 'exported', True), (True, 'configChanges', ('hex', CONFIG_CHANGES))] + ([(True, 'screenOrientation', 6)] if ARGS.landscape else []), [
++    ('meta-data', [(True, 'name', 'android.app.lib_name'), (True, 'value', LIB)], [])]
++    + ([] if ARGS.picker else [('intent-filter', [], [
++        ('action', [(True, 'name', 'android.intent.action.MAIN')], []),
++        ('category', [(True, 'name', 'android.intent.category.LAUNCHER')], [])])]))
++PICKER_ACTIVITY = ('activity', [(True, 'name', 'org.nx2a.DriverPickerActivity'), (True, 'exported', True), (True, 'configChanges', ('hex', CONFIG_CHANGES))], [
++    ('intent-filter', [], [
++        ('action', [(True, 'name', 'android.intent.action.MAIN')], []),
++        ('category', [(True, 'name', 'android.intent.category.LAUNCHER')], [])])])
++ACTIVITIES = [PICKER_ACTIVITY, GAME_ACTIVITY] if ARGS.picker else [GAME_ACTIVITY]
++
+ # (tag, [(ns_android?, name, value)], children)
+ MANIFEST = ('manifest', [(False, 'package', PKG), (True, 'versionCode', ARGS.version_code), (True, 'versionName', ARGS.version_name)], [
+     ('uses-sdk', [(True, 'minSdkVersion', MIN_SDK), (True, 'targetSdkVersion', TARGET_SDK)], []),
+@@ -61,12 +76,7 @@ MANIFEST = ('manifest', [(False, 'package', PKG), (True, 'versionCode', ARGS.ver
+         (True, 'appCategory', 0),   # a game (appCategory game = 0, and the older isGame): Android's game mode and game dashboard, and the device maker's game tools, apply to it
+         # no predictive back: from target SDK 36 the system takes the back gesture itself and finishes the activity, which ends the game (front_android.c on_destroy), without
+         # dispatching KEYCODE_BACK; opted out, the gesture comes as the Back key, which opens the front end's menu
+-        (True, 'enableOnBackInvokedCallback', False)], [
+-        ('activity', [(True, 'name', ARGS.activity), (True, 'exported', True), (True, 'configChanges', ('hex', CONFIG_CHANGES))] + ([(True, 'screenOrientation', 6)] if ARGS.landscape else []), [
+-            ('meta-data', [(True, 'name', 'android.app.lib_name'), (True, 'value', LIB)], []),
+-            ('intent-filter', [], [
+-                ('action', [(True, 'name', 'android.intent.action.MAIN')], []),
+-                ('category', [(True, 'name', 'android.intent.category.LAUNCHER')], [])])])])])
++        (True, 'enableOnBackInvokedCallback', False)], ACTIVITIES)])
+ 
+ def axml(root):
+     # string pool: attribute names that carry resource IDs come first, in resource-map order
+diff --git a/nxnative/dm/android/java/org/nx2a/DriverPickerActivity.java b/nxnative/dm/android/java/org/nx2a/DriverPickerActivity.java
+new file mode 100644
+index 0000000..4156f6f
+--- /dev/null
++++ b/nxnative/dm/android/java/org/nx2a/DriverPickerActivity.java
+@@ -0,0 +1,293 @@
++package org.nx2a;
++
++import android.app.Activity;
++import android.content.Intent;
++import android.content.pm.ApplicationInfo;
++import android.graphics.Color;
++import android.graphics.Typeface;
++import android.opengl.EGL14;
++import android.opengl.EGLConfig;
++import android.opengl.EGLContext;
++import android.opengl.EGLDisplay;
++import android.opengl.EGLSurface;
++import android.opengl.GLES20;
++import android.os.Bundle;
++import android.util.TypedValue;
++import android.view.Gravity;
++import android.view.View;
++import android.view.ViewGroup;
++import android.widget.Button;
++import android.widget.LinearLayout;
++import android.widget.RadioButton;
++import android.widget.RadioGroup;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileReader;
++import java.io.FileWriter;
++import java.io.InputStreamReader;
++import java.util.ArrayList;
++
++/**
++ * A Vulkan driver choice on launch (porter --driver-picker): the app opens this
++ * instead of starting the game at once. The player picks one of the drivers the
++ * APK carries, or the device's own driver, and the choice is written to env.txt's
++ * DM_VK_DRIVER row (porter/driver.py's env_with_driver, same rules) before the
++ * game's activity starts. It shows on every launch, with the last choice
++ * pre-selected: one tap to play, and a driver that force-closes the game is
++ * always one relaunch away from another.
++ *
++ * The packed drivers come from the picker.tsv asset (porter writes it): an
++ * activity= row with the game's NativeActivity class, then a driver= row per
++ * driver, lib name | label | GPU match tokens (exact models like 710 or G57,
++ * or Adreno families like 7xx). The GPU is read through a throwaway EGL
++ * context and the best-matching driver is pre-selected (an exact model beats
++ * a family match); without a match the current env.txt choice is, then the
++ * system's driver when the GPU's family is known but no packed driver serves
++ * it (a Mali CSF GPU against a PanVK build for older models, or an Adreno
++ * generation too new for the packed Turnip builds), then the first driver.
++ * The system's driver is always offered as the escape hatch.
++ */
++public class DriverPickerActivity extends Activity {
++    private static final String ROW = "DM_VK_DRIVER";
++
++    private static class Driver {
++        final String lib, label, family;
++        Driver(String lib, String label, String family) { this.lib = lib; this.label = label; this.family = family; }
++    }
++
++    private final ArrayList<Driver> drivers = new ArrayList<Driver>();
++    private String gameActivity = "org.nx2a.GameActivity";
++    private String selected;   // the picked lib name, or "" for the system's driver
++    private File envFile;
++
++    @Override protected void onCreate(Bundle state) {
++        super.onCreate(state);
++        readPickerAsset();
++        File files = getExternalFilesDir(null);
++        envFile = files == null ? null : new File(files, "env.txt");
++        String gpu = gpuRenderer();
++        String[] info = gpuInfo(gpu);   // {number, family}: {"735", "7xx"} for Adreno, {"G57", "mali"} for Mali, {null, null} otherwise
++        String number = info[0], family = info[1];
++        String current = envDriver();
++
++        LinearLayout root = new LinearLayout(this);
++        root.setOrientation(LinearLayout.VERTICAL);
++        root.setBackgroundColor(Color.parseColor("#121212"));
++        int pad = dp(24);
++        root.setPadding(pad, pad, pad, pad);
++        root.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
++
++        TextView title = new TextView(this);
++        ApplicationInfo app = getApplicationInfo();
++        title.setText(app.loadLabel(getPackageManager()) + " - Vulkan driver");
++        title.setTextColor(Color.WHITE);
++        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
++        title.setTypeface(Typeface.DEFAULT_BOLD);
++        root.addView(title);
++
++        TextView gpuView = new TextView(this);
++        gpuView.setText(gpu == null ? "GPU: unknown" : "GPU: " + gpu);
++        gpuView.setTextColor(Color.parseColor("#AAAAAA"));
++        gpuView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
++        gpuView.setPadding(0, dp(8), 0, dp(20));
++        root.addView(gpuView);
++
++        final RadioGroup group = new RadioGroup(this);
++        group.setOrientation(RadioGroup.VERTICAL);
++        // the system's driver first: it always works, and it is the escape hatch
++        addOption(group, "", "System driver", "the device's own Vulkan driver", family == null);
++        for (Driver d : drivers) {
++            boolean recommended = matchScore(d.family, number, family) > 0;
++            String hint = d.family.isEmpty() ? d.lib : d.family.replace(",", "/") + " - " + d.lib;
++            addOption(group, d.lib, d.label + (recommended ? " (recommended)" : ""), hint, false);
++        }
++        root.addView(group);
++
++        // pre-select: the GPU's best match, else the env.txt choice, else the system's driver when the GPU's family is known but no packed driver serves it,
++        // else the first driver
++        selected = null;
++        int best = 0;
++        for (Driver d : drivers) {
++            int s = matchScore(d.family, number, family);
++            if (s > best) { best = s; selected = d.lib; }
++        }
++        if (selected == null && current != null) selected = current;
++        if (selected == null && family != null) selected = "";
++        if (selected == null && !drivers.isEmpty()) selected = drivers.get(0).lib;
++        if (selected == null) selected = "";
++        for (int i = 0; i < group.getChildCount(); i++) {
++            RadioButton b = (RadioButton) group.getChildAt(i);
++            if (selected.equals(b.getTag())) { b.setChecked(true); break; }
++        }
++        group.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
++            @Override public void onCheckedChanged(RadioGroup g, int id) {
++                View v = g.findViewById(id);
++                if (v != null) selected = (String) v.getTag();
++            }
++        });
++
++        Button play = new Button(this);
++        play.setText("PLAY");
++        play.setTextColor(Color.WHITE);
++        play.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
++        play.setTypeface(Typeface.DEFAULT_BOLD);
++        play.setBackgroundColor(Color.parseColor("#E10600"));
++        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++        lp.topMargin = dp(28);
++        play.setLayoutParams(lp);
++        play.setGravity(Gravity.CENTER);
++        play.setOnClickListener(new View.OnClickListener() {
++            @Override public void onClick(View v) { play(); }
++        });
++        root.addView(play);
++
++        setContentView(root);
++    }
++
++    private void addOption(RadioGroup group, String tag, String label, String hint, boolean checked) {
++        RadioButton b = new RadioButton(this);
++        b.setTag(tag);
++        b.setText(label + "\n" + hint);
++        b.setTextColor(Color.WHITE);
++        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
++        b.setPadding(dp(8), dp(10), dp(8), dp(10));
++        b.setChecked(checked);
++        group.addView(b);
++    }
++
++    private void play() {
++        if (!writeEnv(selected)) Toast.makeText(this, "Could not save the driver choice; the game starts with its previous driver", Toast.LENGTH_LONG).show();
++        try {
++            startActivity(new Intent(this, Class.forName(gameActivity)));
++        } catch (ClassNotFoundException e) {
++            Toast.makeText(this, "The game's activity is missing: " + gameActivity, Toast.LENGTH_LONG).show();
++            return;
++        }
++        finish();
++    }
++
++    /** env.txt with its DM_VK_DRIVER row naming lib, in place of the old row (appended when there was none), or dropped when lib is "" (the system's driver) */
++    private boolean writeEnv(String lib) {
++        if (envFile == null) return false;
++        try {
++            ArrayList<String> out = new ArrayList<String>();
++            boolean done = false;
++            if (envFile.isFile()) {
++                BufferedReader r = new BufferedReader(new FileReader(envFile));
++                String ln;
++                while ((ln = r.readLine()) != null) {
++                    if (ln.trim().startsWith(ROW + "=")) {
++                        if (!lib.isEmpty() && !done) { out.add(ROW + "=" + lib); done = true; }
++                        continue;
++                    }
++                    out.add(ln);
++                }
++                r.close();
++            }
++            if (!lib.isEmpty() && !done) out.add(ROW + "=" + lib);
++            if (out.isEmpty()) return true;   // the system's driver and no env.txt yet: nothing to write
++            FileWriter w = new FileWriter(envFile);
++            for (String l : out) { w.write(l); w.write("\n"); }
++            w.close();
++            return true;
++        } catch (Exception e) { return false; }
++    }
++
++    private String envDriver() {
++        if (envFile == null || !envFile.isFile()) return null;
++        try {
++            BufferedReader r = new BufferedReader(new FileReader(envFile));
++            String ln;
++            while ((ln = r.readLine()) != null) {
++                ln = ln.trim();
++                if (ln.startsWith(ROW + "=")) { r.close(); return ln.substring(ROW.length() + 1).trim(); }
++            }
++            r.close();
++        } catch (Exception e) { /* no env.txt yet: no current choice */ }
++        return null;
++    }
++
++    private void readPickerAsset() {
++        try {
++            BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open("picker.tsv"), "UTF-8"));
++            String ln;
++            while ((ln = r.readLine()) != null) {
++                if (ln.startsWith("activity=")) gameActivity = ln.substring("activity=".length()).trim();
++                else if (ln.startsWith("driver=")) {
++                    String[] f = ln.substring("driver=".length()).split("\\|", -1);
++                    if (f.length >= 2) drivers.add(new Driver(f[0].trim(), f[1].trim(), f.length > 2 ? f[2].trim() : ""));
++                }
++            }
++            r.close();
++        } catch (Exception e) { /* no picker.tsv: only the system's driver is offered */ }
++    }
++
++    /** the GPU's renderer string through a throwaway EGL context, or null */
++    private static String gpuRenderer() {
++        EGLDisplay dpy = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
++        int[] major = new int[1], minor = new int[1];
++        if (dpy == EGL14.EGL_NO_DISPLAY || !EGL14.eglInitialize(dpy, major, 0, minor, 0)) return null;
++        try {
++            int[] cfgAttribs = { EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT, EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
++                    EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_NONE };
++            EGLConfig[] configs = new EGLConfig[1];
++            int[] n = new int[1];
++            if (!EGL14.eglChooseConfig(dpy, cfgAttribs, 0, configs, 0, 1, n, 0) || n[0] == 0) return null;
++            int[] ctxAttribs = { EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE };
++            EGLContext ctx = EGL14.eglCreateContext(dpy, configs[0], EGL14.EGL_NO_CONTEXT, ctxAttribs, 0);
++            if (ctx == EGL14.EGL_NO_CONTEXT) return null;
++            int[] surfAttribs = { EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE };
++            EGLSurface surf = EGL14.eglCreatePbufferSurface(dpy, configs[0], surfAttribs, 0);
++            if (surf == EGL14.EGL_NO_SURFACE || !EGL14.eglMakeCurrent(dpy, surf, surf, ctx)) return null;
++            String renderer = GLES20.glGetString(GLES20.GL_RENDERER);
++            EGL14.eglMakeCurrent(dpy, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
++            EGL14.eglDestroySurface(dpy, surf);
++            EGL14.eglDestroyContext(dpy, ctx);
++            return renderer;
++        } finally { EGL14.eglTerminate(dpy); }
++    }
++
++    /** The GPU's {number, family}: "Adreno (TM) 735" -> {"735", "7xx"}, "Mali-G57 MC2" -> {"G57", "mali"}; {null, null} when the GPU is neither */
++    private static String[] gpuInfo(String renderer) {
++        String[] none = { null, null };
++        if (renderer == null) return none;
++        String r = renderer.toLowerCase();
++        if (r.contains("adreno")) {
++            for (int i = 0; i + 2 < r.length(); i++) {
++                char c = r.charAt(i);
++                if (c >= '6' && c <= '8' && Character.isDigit(r.charAt(i + 1)) && Character.isDigit(r.charAt(i + 2))) {
++                    String number = r.substring(i, i + 3);
++                    return new String[] { number, number.charAt(0) + "xx" };
++                }
++            }
++        }
++        if (r.contains("mali")) {
++            int g = r.indexOf('g');
++            while (g >= 0 && g + 3 <= r.length()) {
++                if (Character.isDigit(r.charAt(g + 1)) && Character.isDigit(r.charAt(g + 2))) {
++                    int end = g + 3;
++                    while (end < r.length() && Character.isDigit(r.charAt(end))) end++;
++                    return new String[] { "G" + r.substring(g + 1, end), "mali" };
++                }
++                g = r.indexOf('g', g + 1);
++            }
++        }
++        return none;
++    }
++
++    /** how well a driver's match tokens fit this GPU: 2 for an exact model (710), 1 for a family (7xx), 0 for no match */
++    private static int matchScore(String tokens, String number, String family) {
++        if (tokens == null || tokens.isEmpty()) return 0;
++        String t = "," + tokens + ",";
++        if (number != null && t.contains("," + number + ",")) return 2;
++        if (family != null && t.contains("," + family + ",")) return 1;
++        return 0;
++    }
++
++    private int dp(int v) {
++        return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
++    }
++}
+diff --git a/porter/cli.py b/porter/cli.py
+index 289ecd9..e9f163a 100644
+--- a/porter/cli.py
++++ b/porter/cli.py
+@@ -32,10 +32,15 @@ def _parser():
+     po.add_argument('--mt-replay', action='store_true',
+                     help='multithread replay: the game\'s Vulkan commands are recorded on a thread of their own (DM_VK_MT_REPLAY=1 in env.txt), for a game whose replay '
+                          'thread holds its frame rate back; it needs a port again (or env.txt edited) to turn off')
+-    po.add_argument('--vulkan-driver', default=None, metavar='FILE',
++    po.add_argument('--vulkan-driver', action='append', default=None, metavar='FILE',
+                     help='an arm64 Vulkan driver library (.so, such as Mesa\'s Turnip for Adreno) to pack in the APK and use instead of the device\'s own driver '
+                          '(DM_VK_DRIVER in env.txt); the app falls back to the device\'s driver when the library does not load. A library not named lib*.so '
+-                         '(vulkan.purple.so) is packed as lib<name>, the only names Android extracts')
++                         '(vulkan.purple.so) is packed as lib<name>, the only names Android extracts. Repeatable: each driver is packed under a name of its own '
++                         '(libraries that share a name get _2, _3, ...), the first is the default, and with --driver-picker the player chooses at launch; a driver '
++                         'is labelled by its folder (Turnip27, Turnip27-A8xx), which also says its Adreno family (a8xx, 7xx, 6xx)')
++    po.add_argument('--driver-picker', action='store_true',
++                    help='a driver choice on launch: the app opens a picker (the packed --vulkan-driver libraries, or the device\'s own driver) instead of starting '
++                         'the game at once; the choice is written to env.txt and the game starts from it. Needs javac and an Android SDK (set ANDROID_HOME)')
+     po.add_argument('--shared-font', default=None, metavar='FILE',
+                     help='a TrueType font (.ttf, one font, not a collection) to pack as the system font the game asks for, instead of the device\'s Roboto: one with CJK '
+                          'characters shows the Chinese and Korean text of a game that draws it with the system font (DM_SHARED_FONT in env.txt); never shipped with the tool')
+@@ -169,7 +174,7 @@ def cmd_port(a):
+     try: install.romfs_target(a.romfs_at)   # a folder the app cannot read fails now, not after the shaders
+     except BuildError as e: print(e, file=sys.stderr); return 2
+     opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, firmware=Path(a.firmware) if a.firmware else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
+-                            app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch, mt_replay=a.mt_replay, vulkan_driver=a.vulkan_driver, shared_font=a.shared_font,
++                            app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch, mt_replay=a.mt_replay, vulkan_driver=a.vulkan_driver, driver_picker=a.driver_picker, shared_font=a.shared_font,
+                             vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, external_display=a.external_display, native_keyboard=a.native_keyboard, jobs=a.jobs)
+     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
+ 
+diff --git a/porter/pipeline.py b/porter/pipeline.py
+index 3f38261..c09ee0d 100644
+--- a/porter/pipeline.py
++++ b/porter/pipeline.py
+@@ -41,7 +41,8 @@ class Options:
+     experimental: bool = False         # a game not ported to Android yet: a provisional profile from upstream's survey (or a copy of its iOS profile), status experimental
+     package: str = ''                  # the app's package instead of the profile's (a test install beside another build of the game)
+     fps60: bool = False                # 60 fps: the profile's own frame-rate cap, else the build's FPSLocker-Warehouse config (porter/fpslocker.py)
+-    vulkan_driver: Path = None         # an arm64 Vulkan driver (Mesa's Turnip) packed in the APK and used instead of the system's (DM_VK_DRIVER, dm/android/gfx_vk_core.c)
++    vulkan_driver: list = None         # arm64 Vulkan drivers (Mesa's Turnip) packed in the APK and used instead of the system's (DM_VK_DRIVER, dm/android/gfx_vk_core.c); the first is the default, the rest are for the driver picker
++    driver_picker: bool = False        # a driver choice on launch: the app opens a picker (the packed drivers, or the system's) instead of starting the game at once
+     shared_font: Path = None           # a TrueType font packed as the system's shared fonts, instead of the device's Roboto (DM_SHARED_FONT, dm/host/hle_sdk16.c)
+     firmware: Path = None              # the player's system content files (.nca), for the profile's sysdata titles (extract_sysdata; DM_SYSDATA, dm/host/hle_fs.c)
+     mt_replay: bool = False            # multithread replay: DM_VK_MT_REPLAY=1 in env.txt (dm/android/gfx_vk_dq.c), after the profile's env rows
+@@ -67,6 +68,35 @@ def driver_lib_name(path):
+     return name if name.startswith('lib') else f'lib{name}'
+ 
+ 
++def driver_family(label):
++    """The GPUs a driver label names, as comma-separated match tokens: exact Adreno models (710, 720, 722), Adreno families (6xx, 7xx, 8xx), and exact Mali models
++    (G57, G77, ...) for a PanVK build. The standard Turnip build lives in a folder like Turnip27-6xx-7xx, the A8xx build in Turnip27-A8xx, the midrange build in
++    Turnip27-710-720-722, a PanVK build in PanVK-G52-G57-G68-G71-G72-G76-G77-G78; '' when the label says none. The picker prefers an exact-model match over a family
++    match, so a 710 GPU gets the midrange build while a 735 gets the standard one. Mali has no family token on purpose: a PanVK build serves the models it names,
++    not every Mali GPU (the CSF models G610 and newer need their own build), so a Mali GPU with no exact match falls back to the system's driver"""
++    low = label.lower()
++    tokens = [m for m in ('710', '720', '722') if m in low]
++    tokens += [f for f in ('6xx', '7xx', '8xx') if f in low or ('a' + f) in low or ('gen' + f[0]) in low]
++    if 'panvk' in low or 'mali' in low:
++        tokens += [m for m in ('G52', 'G57', 'G68', 'G71', 'G72', 'G76', 'G77', 'G78', 'G610', 'G615', 'G710', 'G720') if m.lower() in low]
++    return ','.join(tokens)
++
++
++def driver_entries(drivers):
++    """(source, lib name, label, family) per --vulkan-driver: the label is the library's folder (Turnip27, Turnip27-A8xx), and libraries that would share a lib
++    name (every Turnip zip's libvulkan_freedreno.so) get _2, _3, ... so each packed driver is a file of its own"""
++    out, used = [], set()
++    for d in drivers or []:
++        name = driver_lib_name(d)
++        if name in used:
++            stem, n = name[:-3], 2
++            while f'{stem}_{n}.so' in used: n += 1
++            name = f'{stem}_{n}.so'
++        used.add(name)
++        out.append((d, name, d.parent.name, driver_family(d.parent.name)))
++    return out
++
++
+ def app_stem(g, name):   # the file name of the APK and the data pack: the profile's iOS IPA name without .ipa (NeoTheWorldEndsWithYou)
+     ipa = g.get('ipa') or nsp.ipa_name(name, g.title_id)
+     return ipa[:-4] if ipa.endswith('.ipa') else ipa
+@@ -211,8 +241,10 @@ class Port:
+         if not o.folder.is_dir(): raise BuildError(f'not a folder: {o.folder}')
+         version_code('v0', o.vercode_offset); alias_headroom_gb(o.alias_headroom)   # an offset or headroom out of range fails now, not after the shaders
+         if o.vulkan_driver:
+-            o.vulkan_driver = Path(o.vulkan_driver).expanduser().resolve()
+-            if not o.vulkan_driver.is_file() or o.vulkan_driver.suffix != '.so': raise BuildError(f'--vulkan-driver: not a .so library: {o.vulkan_driver}')
++            o.vulkan_driver = [Path(d).expanduser().resolve() for d in o.vulkan_driver]
++            for d in o.vulkan_driver:
++                if not d.is_file() or d.suffix != '.so': raise BuildError(f'--vulkan-driver: not a .so library: {d}')
++        if o.driver_picker and not o.vulkan_driver: raise BuildError('--driver-picker needs at least one --vulkan-driver to choose from')
+         if o.shared_font:
+             o.shared_font = Path(o.shared_font).expanduser().resolve()
+             if not o.shared_font.is_file() or o.shared_font.suffix.lower() != '.ttf': raise BuildError(f'--shared-font: not a .ttf font: {o.shared_font}')
+@@ -771,34 +803,56 @@ class Port:
+         code = version_code(self.pkg_ver, self.o.vercode_offset)
+         if self.o.vercode_offset: say(f'versionCode {code} ({self.pkg_ver} + 1 + offset {self.o.vercode_offset})')
+         external = self.external_activity() if self.o.external_display or self.o.native_keyboard else []
+-        driver = self.o.vulkan_driver
+-        if driver and driver.name != driver_lib_name(driver):   # packed under a lib*.so name (driver_lib_name), copied beside the host library
+-            driver = self.so.parent / driver_lib_name(driver); shutil.copyfile(self.o.vulkan_driver, driver)
+-            say(f'--vulkan-driver: {self.o.vulkan_driver.name} is packed as {driver.name} (Android extracts only lib*.so libraries)')
++        drivers = driver_entries(self.o.vulkan_driver)
++        packed = []
++        for src, name, label, _fam in drivers:   # packed under a lib*.so name (driver_lib_name), copied beside the host library
++            dst = self.so.parent / name
++            if src.name != name or src.parent != self.so.parent: shutil.copyfile(src, dst)
++            packed.append(dst)
++            say(f'--vulkan-driver: {src.name} is packed as {name} ({label})' + ('' if src.name == name else ' (Android extracts only lib*.so libraries)'))
++        picker = self.driver_picker(external) if self.o.driver_picker else []
+         nsp.run([PY, DM / 'android/apk/mkapk.py', self.so, self.apk_path, paths.signing_key(), '--package', self.package, '--label', self.app_name, '--lib', 'dmhost',
+                  '--version-code', str(code), '--version-name', self.display]
+-                + (['--landscape'] if self.ap.landscape else []) + icon + self.theme() + self.ui_font() + external + ([] if self.o.debug else ['--release'])
+-                + [a for f in ([driver] + [self.so.parent / n for n in ADRENOTOOLS_LIBS] if driver else []) for a in ('--extra-so', str(f))],
++                + (['--landscape'] if self.ap.landscape else []) + icon + self.theme() + self.ui_font() + external + picker + ([] if self.o.debug else ['--release'])
++                + [a for f in (packed + [self.so.parent / n for n in ADRENOTOOLS_LIBS] if packed else []) for a in ('--extra-so', str(f))],
+                 self.logs / 'android_apk.log', env=self.env)
+         self.result['apk'] = str(self.apk_path)
+         PROG.end(f'{self.apk_path.name}, {self.apk_path.stat().st_size / 2**20:.1f} MB')
+ 
+-    def external_activity(self):
++    def java_dex(self):
++        """The Java sources (dm/android/java/org/nx2a) compiled to a classes.dex: the external activity and the driver picker share the one build"""
+         javac = shutil.which('javac')
+         roots = toolchain._sdk_roots()
+         platforms = [p for root in roots for p in (root / 'platforms').glob('android-*/android.jar')]
+         d8s = [p for root in roots for p in (root / 'build-tools').glob('*/d8' + ('.bat' if os.name == 'nt' else ''))]
+         def version(p): return tuple(int(x) for x in re.findall(r'\d+', p.parent.name))
+         if not javac or not platforms or not d8s:
+-            raise BuildError('--external-display / --native-keyboard needs javac and an Android SDK with a platform and build-tools (set ANDROID_HOME)')
++            raise BuildError('the Java activity needs javac and an Android SDK with a platform and build-tools (set ANDROID_HOME)')
+         platform, d8 = max(platforms, key=version), max(d8s, key=version)
+-        out = self.aw / 'external-activity'; classes, dex = out / 'classes', out / 'dex'
++        out = self.aw / 'java-activity'; classes, dex = out / 'classes', out / 'dex'
+         shutil.rmtree(out, ignore_errors=True); classes.mkdir(parents=True); dex.mkdir()
+         sources = sorted((DM / 'android/java/org/nx2a').glob('*.java'))
+-        nsp.run([javac, '-source', '8', '-target', '8', '-classpath', platform, '-d', classes, *sources], self.logs / 'android_external_java.log', env=self.env)
+-        nsp.run([d8, '--min-api', '29', '--lib', platform, '--output', dex, *sorted(classes.rglob('*.class'))], self.logs / 'android_external_dex.log', env=self.env)
++        nsp.run([javac, '-source', '8', '-target', '8', '-classpath', platform, '-d', classes, *sources], self.logs / 'android_java.log', env=self.env)
++        nsp.run([d8, '--min-api', '29', '--lib', platform, '--output', dex, *sorted(classes.rglob('*.class'))], self.logs / 'android_dex.log', env=self.env)
++        return dex / 'classes.dex'
++
++    def external_activity(self):
++        dex = self.java_dex()
+         activity = 'KeyboardExternalActivity' if self.o.native_keyboard else 'ExternalActivity'
+-        return ['--dex', dex / 'classes.dex', '--activity', 'org.nx2a.' + activity if self.o.external_display else 'org.nx2a.GameActivity']
++        return ['--dex', dex, '--activity', 'org.nx2a.' + activity if self.o.external_display else 'org.nx2a.GameActivity']
++
++    def driver_picker(self, external):
++        """The driver picker's mkapk arguments: --picker, the dex (the external activity's when there is one), and the picker.tsv asset naming the game's
++        activity and the packed drivers (lib name | label | Adreno family), which org.nx2a.DriverPickerActivity reads at launch"""
++        dex = None if external else self.java_dex()
++        activity = external[external.index('--activity') + 1] if '--activity' in external else 'android.app.NativeActivity'
++        rows = ['# the driver picker (org.nx2a.DriverPickerActivity) reads this asset: the game\'s activity, then a driver= row per packed driver (lib name | label | GPU match tokens)',
++                f'activity={activity}']
++        for (_src, name, label, fam) in driver_entries(self.o.vulkan_driver):
++            rows.append(f'driver={name}|{label}|{fam}')
++        tsv = self.aw / 'picker.tsv'; tsv.write_text('\n'.join(rows) + '\n', encoding='utf-8')
++        say(f'driver picker: {len(rows) - 2} drivers, game activity {activity}')
++        return (['--dex', dex] if dex else []) + ['--picker', '--asset', f'picker.tsv={tsv}']
+ 
+     def theme(self):
+         """The on-screen gamepad's theme: only the game's own pack goes in the APK (dm/android/themes/themes.tsv maps title IDs to packs; a game with no row
+@@ -838,7 +892,7 @@ class Port:
+         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
+         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
+                              aoc=self.aoc, sysdata=self.sysdata, language=self.lang, package=self.package, env=self.fps_env + font_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
+-                             + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
++                             + ([f'DM_VK_DRIVER={driver_entries(self.o.vulkan_driver)[0][1]}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
+                              files={**self.fps_files, **font_files}, profile_h=getattr(self, 'profile_h', None),
+                              progress=lambda what: PROG.set(step=f'linking {what}'))
+         self.data_path = dst; self.result['data'] = str(dst)

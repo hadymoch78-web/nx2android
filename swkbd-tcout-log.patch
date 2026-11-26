@@ -1,0 +1,11 @@
+--- a/nxnative/dm/host/hle_swkbd.c
++++ b/nxnative/dm/host/hle_swkbd.c
+@@ -113,6 +113,8 @@
+         uint8_t tc_out[0x7D4]; size_t tc_len = 0;   // the checked text goes here (GetRequiredStringBufferSize); the host keeps the typed text, the callback's output is the applet's to show
+         int tc = cb2 ? ((swkbd_tc_cb2)cb2)(tc_out, &tc_len, &str, &str, &str) : ((swkbd_tc_cb1)cb1)(tc_out, &tc_len, &str);
+         LOG("swkbd: text check %s returned %d, out length %zu", cb2 ? "cb2" : "cb1", tc, tc_len);
++        { char hex[65]; size_t m = tc_len < 32 ? tc_len : 32; for (size_t i = 0; i < m; i++) snprintf(hex + i * 2, 3, "%02x", tc_out[i]); hex[m * 2] = 0;
++          LOG("swkbd: text check out bytes: %s", hex); }   // TEMP DIAG: what the game's callback actually writes (Grand Bazaar name bug)
+       } }
+     { const char *lag = getenv("DM_TEST_SWKBD_LAG_MS"); if (lag) usleep((useconds_t)atoi(lag) * 1000); }   // test: slow down "keyboard handed back → the game's thread gets the result" to verify that auto-accept does not jump the gun   // front end path cleanup (dm_cursor.c): auto-accept after the name is typed on the naming page
+     return RES_OK;

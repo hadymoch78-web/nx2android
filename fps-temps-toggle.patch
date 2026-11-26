@@ -1,0 +1,15 @@
+diff --git a/nxnative/dm/android/gfx_vk_present.c b/nxnative/dm/android/gfx_vk_present.c
+index 3e4d313..f6ba81c 100644
+--- a/nxnative/dm/android/gfx_vk_present.c
++++ b/nxnative/dm/android/gfx_vk_present.c
+@@ -585,7 +585,9 @@ static void ov_fps(VkCommandBuffer cb, int64_t now) {   // one value a row: FPS,
+     else if (now - t0 >= 500000000ll) { fps = (int)((double)(n - n0) * 1e9 / (double)(now - t0) + 0.5); t0 = now; n0 = n; }
+     char rows[3][16]; int nr = 0, hot[3] = {0};
+     if (fps < 0) snprintf(rows[nr++], 16, "FPS --"); else snprintf(rows[nr++], 16, "FPS %d", fps > 999 ? 999 : fps);
+-    int soc = -1000, bat = -1000; dm_android_temps(&soc, &bat);   // front_android.c: the chip's hottest CPU / GPU zone and the battery, whole degrees C (-1000: not known)
++    // DM_FPS_TEMPS=0 hides the temperature rows (the FPS row stays): the counter is only the frame rate then
++    static int show_temps = -1; if (show_temps < 0) { const char *e = getenv("DM_FPS_TEMPS"); show_temps = !(e && !atoi(e)); }
++    int soc = -1000, bat = -1000; if (show_temps) dm_android_temps(&soc, &bat);   // front_android.c: the chip's hottest CPU / GPU zone and the battery, whole degrees C (-1000: not known)
+     // red from where it is dangerously hot: the chip at 80 C (phones throttle hard in the high 80s), the battery at 45 C (Android's warnings and charging limits)
+     if (soc > -100 && soc < 1000) { hot[nr] = soc >= 80; snprintf(rows[nr++], 16, "SOC %dC", soc); }
+     if (bat > -100 && bat < 1000) { hot[nr] = bat >= 45; snprintf(rows[nr++], 16, "BAT %dC", bat); }

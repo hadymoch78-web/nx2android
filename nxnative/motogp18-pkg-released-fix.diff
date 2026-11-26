@@ -1,0 +1,15 @@
+--- a/nxnative/dm/android/gfx_vk_tex.c
++++ b/nxnative/dm/android/gfx_vk_tex.c
+@@ -440,7 +440,11 @@ static vkimg_t *vk_tex_(const tex_t *t) {
+         if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
+         else {
+             uint64_t now = nvn_dirty_now();
+-            if (im->pkg_sparse) { if (nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, im->pkg_vgen, im->pkg_stamp)) pkg_upload(im, t, f); }   // mapped or written since
++            if (im->pkg_released) {   // write protection was given up by vk_tex_sweep: nvn_dirty_since_span below cannot see writes to unprotected pages, so a texture whose pool was rewritten after release would keep stale (possibly zero) content forever. Re-upload on re-use, as the sweep's comment promises; keep the GPU-written guard from the dirty branch.
++                if (im->gpu_w && pkg_hash(t->mem, t->L.size) == im->pkg_hash) { nvn_dirty_protect(t->mem, t->L.size); im->pkg_stamp = nvn_dirty_now(); im->pkg_released = 0; }
++                else pkg_upload(im, t, f);
++            }
++            else if (im->pkg_sparse) { if (nvn_sparse_since(t->pool, (uint64_t)(uintptr_t)t->mem, t->L.size, im->pkg_vgen, im->pkg_stamp)) pkg_upload(im, t, f); }   // mapped or written since
+             else if (now != im->pkg_seen && nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp)) {   // pages written since the upload
+                 // The GPU wrote the image since (a compute shader's image stores, a copy, a render) and its storage still holds the bytes of the upload: the writes were around
+                 // it on shared pages, and an upload would put the CPU's bytes over the GPU's. Monster Hunter Rise's spot light profiles (512x1x64 R16F, written by a compute

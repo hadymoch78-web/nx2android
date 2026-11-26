@@ -1,0 +1,26 @@
+diff --git a/nxnative/dm/android/front_android.c b/nxnative/dm/android/front_android.c
+index 62574a4..54f048c 100644
+--- a/nxnative/dm/android/front_android.c
++++ b/nxnative/dm/android/front_android.c
+@@ -238,7 +238,20 @@ static uint64_t key_bit(int32_t k) {   // Nintendo layout by position: the botto
+     default: return 0;
+     }
+ }
+-static int32_t axis(float v) { if (v > -0.12f && v < 0.12f) return 0; return (int32_t)(v * DM_STICK_MAX); }
++// The sticks' dead zone and response curve (DM_STICK_DEADZONE, DM_STICK_CURVE, read once): a smaller dead zone than the 0.12 the sticks had, and a power below 1
++// makes small deflections count for more (a racing game's steering answers sooner), while full deflection still reaches the maximum. 1.0 for the curve is linear.
++static float g_stick_dz = -1, g_stick_curve = -1;
++static int32_t axis(float v) {
++    if (g_stick_dz < 0) {
++        const char *d = getenv("DM_STICK_DEADZONE"), *c = getenv("DM_STICK_CURVE");
++        g_stick_dz = d ? fminf(0.5f, fmaxf(0.f, strtof(d, NULL))) : 0.05f;
++        g_stick_curve = c ? fminf(2.f, fmaxf(0.1f, strtof(c, NULL))) : 0.7f;
++    }
++    float a = fabsf(v);
++    if (a < g_stick_dz) return 0;
++    float s = (a - g_stick_dz) / (1.f - g_stick_dz);   // rescale past the dead zone so the output starts at 0 and still reaches the maximum
++    return (int32_t)(copysignf(powf(s, g_stick_curve), v) * DM_STICK_MAX);
++}
+ static uint64_t g_shake_btn;   // DM_BTN_SHAKE while the device is being shaken (below); input thread only
+ static uint64_t pad_axis_buttons(const float axes[8]) {
+     uint64_t b = 0;
